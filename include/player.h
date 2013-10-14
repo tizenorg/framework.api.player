@@ -1033,26 +1033,59 @@ int player_is_x11_display_visible(player_h player, bool* visible);
  * @brief Sets the zoom level of the x surface video display
  * @remarks If current display type is not #PLAYER_DISPLAY_TYPE_X11, no operation is performed.
  * @param[in] player   The handle to media player
- * @param[in] level The level of zoom [1~9]
+ * @param[in] level The level of zoom [1.0~9.0]
  * @return 0 on success, otherwise a negative error value.
  * @retval #PLAYER_ERROR_NONE Successful
  * @retval #PLAYER_ERROR_INVALID_PARAMETER Invalid parameter
  * @retval #PLAYER_ERROR_INVALID_STATE Invalid state
+ * @pre The player state must be #PLAYER_STATE_READY by player_prepare() or #PLAYER_STATE_PLAYING by player_start() or #PLAYER_STATE_PAUSED by player_pause().
  * @see  player_get_x11_display_zoom()
  */
-int player_set_x11_display_zoom(player_h player, int level);
+int player_set_x11_display_zoom(player_h player, float level);
 
 /**
  * @brief Gets a zoom level of the x surface video display
  * @remarks If current display type is not #PLAYER_DISPLAY_TYPE_X11, no operation is performed.
  * @param[in] player The handle to media player
- * @param[out] level The level of zoom [1~9]
+ * @param[out] level The level of zoom [1.0~9.0]
  * @return 0 on success, otherwise a negative error value.
  * @retval  #PLAYER_ERROR_NONE Successful
  * @retval  #PLAYER_ERROR_INVALID_PARAMETER Invalid parameter
+ * @retval #PLAYER_ERROR_INVALID_STATE Invalid state
+ * @pre The player state must be #PLAYER_STATE_READY by player_prepare() or #PLAYER_STATE_PLAYING by player_start() or #PLAYER_STATE_PAUSED by player_pause().
  * @see	player_set_x11_display_zoom()
  */
-int player_get_x11_display_zoom( player_h player, int *level);
+int player_get_x11_display_zoom(player_h player, float *level);
+
+/**
+ * @brief Sets start display position
+ * @remarks If current display type is not #PLAYER_DISPLAY_TYPE_X11, no operation is performed.
+ * @param[in] player   The handle to media player
+ * @param[in] offset_x start x position from video to display
+ * @param[in] offset_y start y position from video to display
+ * @return 0 on success, otherwise a negative error value.
+ * @retval #PLAYER_ERROR_NONE Successful
+ * @retval #PLAYER_ERROR_INVALID_PARAMETER Invalid parameter
+ * @retval #PLAYER_ERROR_INVALID_STATE Invalid state
+ * @pre The player state must be #PLAYER_STATE_READY by player_prepare() or #PLAYER_STATE_PLAYING by player_start() or #PLAYER_STATE_PAUSED by player_pause().
+ * @see  player_get_x11_display_zoom_start_position()
+ */
+int player_set_x11_display_zoom_start_position(player_h player, int offset_x, int offset_y);
+
+/**
+ * @brief Sets the zoom level of the x surface video display
+ * @remarks If current display type is not #PLAYER_DISPLAY_TYPE_X11, no operation is performed.
+ * @param[in] player   The handle to media player
+ * @param[out] offset_x current start x position from video to display
+ * @param[out] offset_y current start y position from video to display
+ * @return 0 on success, otherwise a negative error value.
+ * @retval #PLAYER_ERROR_NONE Successful
+ * @retval #PLAYER_ERROR_INVALID_PARAMETER Invalid parameter
+ * @retval #PLAYER_ERROR_INVALID_STATE Invalid state
+ * @pre The player state must be #PLAYER_STATE_READY by player_prepare() or #PLAYER_STATE_PLAYING by player_start() or #PLAYER_STATE_PAUSED by player_pause().
+ * @see  player_set_x11_display_zoom_start_position
+ */
+int player_get_x11_display_zoom_start_position(player_h player, int *offset_x, int *offset_y);
 
 /**
  * @internal

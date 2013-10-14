@@ -732,6 +732,12 @@ int player_unprepare (player_h player)
 	}
 	else
 	{
+		if (handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
+		{
+			handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+			handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+		}
+
 		handle->state = PLAYER_STATE_IDLE;
 		handle->display_type = MM_DISPLAY_SURFACE_NULL; // means DISPLAY_TYPE_NONE(3)
 		handle->is_set_pixmap_cb = false;
@@ -946,14 +952,18 @@ int player_stop (player_h player)
 		{
 			return __convert_error_code(ret,(char*)__FUNCTION__);
 		}
-		if(handle->display_type == PLAYER_DISPLAY_TYPE_X11 || handle->display_type == PLAYER_DISPLAY_TYPE_EVAS)
+		else
 		{
-			ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 0, (char*)NULL);
-			if(ret != MM_ERROR_NONE)
+			if (handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
 			{
-				return __convert_error_code(ret,(char*)__FUNCTION__);
+				handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+				handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
 			}
-			LOGE("[%s] show video display : %d",__FUNCTION__, ret);
+
+			handle->state = PLAYER_STATE_READY;
+			handle->is_stopped = TRUE;
+			LOGI("[%s] End", __FUNCTION__);
+			return PLAYER_ERROR_NONE;
 		}
 
 		handle->state = PLAYER_STATE_READY;
@@ -1521,13 +1531,20 @@ int player_is_x11_display_visible(player_h player, bool* visible)
 	}
 }
 
-int player_set_x11_display_zoom(player_h player, int level)
+int player_set_x11_display_zoom(player_h player, float level)
 {
 	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_CHECK_CONDITION(level>0 && level < 10 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
+	PLAYER_CHECK_CONDITION(level>0.0 && level <= 9.0 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
 
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_zoom" , level, (char*)NULL);
+
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_set_display_zoom(handle->mm_handle, level);
 	if(ret != MM_ERROR_NONE)
 	{
 		return __convert_error_code(ret,(char*)__FUNCTION__);
@@ -1536,23 +1553,74 @@ int player_set_x11_display_zoom(player_h player, int level)
 		return PLAYER_ERROR_NONE;
 }
 
-int player_get_x11_display_zoom( player_h player, int *level)
+int player_get_x11_display_zoom( player_h player, float *level)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(level);
 	player_s * handle = (player_s *) player;
-	int _level;
-	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_zoom" , &_level, (char*)NULL);
+
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_get_display_zoom(handle->mm_handle, level);
 	if(ret != MM_ERROR_NONE)
 	{
-		*level=-1;
+		*level=-1.0;
 		return __convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
-	{
-		*level = _level;
 		return PLAYER_ERROR_NONE;
+}
+
+int player_set_x11_display_zoom_start_position(player_h player, int x, int y)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_CHECK_CONDITION(x >= 0 && y >= 0, PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
+
+	player_s * handle = (player_s *) player;
+
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
 	}
+
+	int ret = mm_player_set_display_zoom_start_position(handle->mm_handle, x, y);
+	if(ret != MM_ERROR_NONE)
+	{
+		return __convert_error_code(ret,(char*)__FUNCTION__);
+	}
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_get_x11_display_zoom_start_position(player_h player, int *x, int *y)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(x);
+	PLAYER_NULL_ARG_CHECK(y);
+
+	player_s * handle = (player_s *) player;
+
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_get_display_zoom_start_position(handle->mm_handle, x, y);
+	if(ret != MM_ERROR_NONE)
+	{
+		*x = -1;
+		*y = -1;
+		return __convert_error_code(ret,(char*)__FUNCTION__);
+	}
+	else
+		return PLAYER_ERROR_NONE;
+
 }
 
 int player_set_x11_display_pixmap (player_h player, player_x11_pixmap_updated_cb callback, void *user_data)

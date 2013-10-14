@@ -23,7 +23,7 @@
 #include <Ecore_X.h>
 
 #define PACKAGE "player_test"
-#define MAX_STRING_LEN		2048
+#define MAX_STRING_LEN	2048
 #define MMTS_SAMPLELIST_INI_DEFAULT_PATH "/opt/etc/mmts_filelist.ini"
 #define INI_SAMPLE_LIST_MAX 9
 char g_uri[MAX_STRING_LEN];
@@ -43,14 +43,22 @@ enum
 	CURRENT_STATUS_DISPLAY_ROTATION,
 	CURRENT_STATUS_DISPLAY_VISIBLE,
 	CURRENT_STATUS_DISPLAY_ROI,
-	CURRENT_STATUS_SUBTITLE_FILENAME
+	CURRENT_STATUS_DISPLAY_ZOOM_LEVEL,
+	CURRENT_STATUS_DISPLAY_ZOOM_OFFSET,
+	CURRENT_STATUS_SUBTITLE_FILENAME,
 };
+
+/* for video display */
+Ecore_X_Window g_xid;
 
 struct appdata
 {
 	Evas *evas;
 	Ecore_Evas *ee;
 	Evas_Object *win;
+	Evas_Object *bg;
+	Evas_Object *rect;
+	Evas_Object *eo;
 
 	Evas_Object *layout_main; /* layout widget based on EDJ */
 	Ecore_X_Window xid;
@@ -64,8 +72,7 @@ static void win_del(void *data, Evas_Object *obj, void *event)
 
 static Evas_Object* create_win(const char *name)
 {
-		Evas_Object *eo;
-		int w, h;
+	Evas_Object *eo = NULL;
 
 		printf ("[%s][%d] name=%s\n", __func__, __LINE__, name);
 
@@ -74,39 +81,88 @@ static Evas_Object* create_win(const char *name)
 				elm_win_title_set(eo, name);
 				elm_win_borderless_set(eo, EINA_TRUE);
 				evas_object_smart_callback_add(eo, "delete,request",win_del, NULL);
-				ecore_x_window_size_get(ecore_x_window_root_first_get(),&w, &h);
-				evas_object_resize(eo, w, h);
 		}
-
 		return eo;
 }
 
+
+static Evas_Object *create_bg(Evas_Object *pParent)
+{
+	if(!pParent) {
+		return NULL;
+	}
+
+	Evas_Object *pObj = NULL;
+
+	pObj = elm_bg_add(pParent);
+	evas_object_size_hint_weight_set(pObj, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
+	elm_win_resize_object_add(pParent, pObj);
+	evas_object_color_set(pObj, 0, 0, 0, 0);
+	evas_object_show(pObj);
+	return pObj;
+}
+static Evas_Object *create_render_rect(Evas_Object *pParent)
+{
+	if(!pParent) {
+		return NULL;
+	}
+
+	Evas *pEvas = evas_object_evas_get(pParent);
+	Evas_Object *pObj = evas_object_rectangle_add(pEvas);
+	if(pObj == NULL) {
+		return NULL;
+	}
+
+	evas_object_size_hint_weight_set(pObj, EVAS_HINT_EXPAND, EVAS_HINT_EXPAND);
+	evas_object_color_set(pObj, 0, 0, 0, 0);
+	evas_object_render_op_set(pObj, EVAS_RENDER_COPY);
+	evas_object_show(pObj);
+	elm_win_resize_object_add(pParent, pObj);
+
+	return pObj;
+}
+
+
 static int app_create(void *data)
 {
-		struct appdata *ad = data;
-		Evas_Object *win;
-		/* create window */
-		win = create_win(PACKAGE);
-		if (win == NULL)
-				return -1;
-		ad->win = win; 
-		evas_object_show(win); 
-		return 0;
+	struct appdata *ad = data;
+	Evas_Object *win = NULL;
+
+	/* use gl backend */
+	elm_config_preferred_engine_set("opengl_x11");
+
+	/* create window */
+	win = create_win(PACKAGE);
+	if (win == NULL)
+			return -1;
+	ad->win = win;
+
+	ad->bg = create_bg(ad->win);
+	ad->rect = create_render_rect(ad->win);
+	/* Create xwindow for X surface */
+	g_xid = elm_win_xwindow_get(ad->win);
+
+	elm_win_activate(win);
+	evas_object_show(win);
+
+	return 0;
 }
 
 static int app_terminate(void *data)
 {
-		struct appdata *ad = data;
+	struct appdata *ad = data;
 
-		if (ad->win)
-				evas_object_del(ad->win);
+	if (ad->win) {
+		evas_object_del(ad->win);
+		ad->win = NULL;
+	}
 
-		return 0;
+	return 0;
 }
 
 struct appcore_ops ops = {
-		.create = app_create,
-		.terminate = app_terminate,
+	.create = app_create,
+	.terminate = app_terminate,
 };
 
 struct appdata ad;
@@ -227,7 +283,7 @@ static void _player_prepare(bool async)
 		player_set_subtitle_path(g_player,g_subtitle_uri);
 		player_set_subtitle_updated_cb(g_player, subtitle_updated_cb, (void*)g_player);
 	}
-	player_set_display(g_player,PLAYER_DISPLAY_TYPE_X11,GET_DISPLAY(ad.xid));
+	player_set_display(g_player,PLAYER_DISPLAY_TYPE_X11,GET_DISPLAY(g_xid));
 	player_set_buffering_cb(g_player, buffering_cb, (void*)g_player);
 	player_set_completed_cb(g_player, completed_cb, (void*)g_player);
 	player_set_uri(g_player, g_uri);
@@ -354,6 +410,39 @@ static void set_position_ratio(int percent)
 	{
 		g_print("failed to set position ratio\n");
 	}
+}
+
+static void set_zoom_level(float level)
+{
+	float _level = 0.0;
+	if ( player_set_x11_display_zoom(g_player, level) != PLAYER_ERROR_NONE )
+	{
+		g_print("failed to set zoom level\n");
+	}
+
+	if ( player_get_x11_display_zoom(g_player, &_level) != PLAYER_ERROR_NONE )
+	{
+		g_print("failed to set zoom level\n");
+	}
+
+	g_print("current zoom level = %f", _level);
+}
+
+static void set_display_zoom_pos(int x, int y)
+{
+	int _off_x = 0;
+	int _off_y = 0;
+	if ( player_set_x11_display_zoom_start_position(g_player, x, y) != PLAYER_ERROR_NONE )
+	{
+		g_print("failed to set zoom level\n");
+	}
+
+	if ( player_get_x11_display_zoom_start_position(g_player, &_off_x, &_off_y) != PLAYER_ERROR_NONE )
+	{
+		g_print("failed to set zoom level\n");
+	}
+
+	g_print("current zoom pos =  (%d,  %d)\n", _off_x, _off_y);
 }
 
 static void get_duration()
@@ -729,6 +818,14 @@ void _interpret_main_menu(char *cmd)
 		{
 			_player_prepare(FALSE); // sync
 		}
+		else if (strncmp(cmd, "zl", 2) == 0)
+		{
+			g_menu_state = CURRENT_STATUS_DISPLAY_ZOOM_LEVEL;
+		}
+		else if (strncmp(cmd, "zp", 2) == 0)
+		{
+			g_menu_state = CURRENT_STATUS_DISPLAY_ZOOM_OFFSET;
+		}
 		else if (strncmp(cmd, "pa", 2) == 0)
 		{
 			_player_prepare(TRUE); // async
@@ -800,6 +897,8 @@ void display_sub_basic()
 	g_print("w. Get display visible\t");
 	g_print("x. Set ROI\t");
 	g_print("y. Get ROI\n");
+	g_print("[x display] zl. set zoom level\t");
+	g_print("zp. Set zoom start\t");
 	g_print("[subtitle] A. Set subtitle path\n");
 	g_print("[Video Capture] C. Capture \n");
 	g_print("[Audio Frame Decode] D. Decoding Audio Frame  E. Decoding Video Frame \n");
@@ -855,9 +954,17 @@ static void displaymenu()
 	{
 		g_print("*** input display roi value sequencially.(x, y, w, h)\n");
 	}
+	else if (g_menu_state == CURRENT_STATUS_DISPLAY_ZOOM_OFFSET)
+	{
+		g_print("*** input display zoom start(x, y)\n");
+	}
 	else if (g_menu_state == CURRENT_STATUS_SUBTITLE_FILENAME)
 	{
 		g_print(" *** input  subtitle file path.\n");
+	}
+	else if (g_menu_state == CURRENT_STATUS_DISPLAY_ZOOM_LEVEL)
+	{
+		g_print("*** input zoom level (0.0~9.0)\n");
 	}
 	else
 	{
@@ -932,6 +1039,36 @@ static void interpret (char *cmd)
 			long percent = atol(cmd);
 			set_position_ratio(percent);
 			reset_menu_state();
+		}
+		break;
+		case CURRENT_STATUS_DISPLAY_ZOOM_LEVEL:
+		{
+			float level = atof(cmd);
+			set_zoom_level(level);
+			reset_menu_state();
+		}
+		break;
+		case CURRENT_STATUS_DISPLAY_ZOOM_OFFSET:
+		{
+			int value = atoi(cmd);
+			static int off_x = 0;
+			static int off_y = 0;
+			static int cnt = 0;
+			switch (cnt) {
+			case 0:
+				off_x = value;
+				cnt++;
+				break;
+			case 1:
+				off_y = value;
+				cnt = 0;
+				set_display_zoom_pos(off_x, off_y);
+				off_x = off_y = 0;
+				reset_menu_state();
+				break;
+			default:
+				break;
+			}
 		}
 		break;
 		case CURRENT_STATUS_LOOPING:
