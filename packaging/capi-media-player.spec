@@ -1,12 +1,7 @@
 Name:       capi-media-player
 Summary:    A Media Player library in Tizen Native API
-%if 0%{?tizen_profile_mobile}
-Version:    0.1.0
+Version:    0.1.58
 Release:    0
-%else
-Version:    0.2.0
-Release:    0
-%endif
 Group:      TO_BE/FILLED_IN
 License:    TO BE FILLED IN
 Source0:    %{name}-%{version}.tar.gz
@@ -16,12 +11,13 @@ BuildRequires:  pkgconfig(mm-player)
 BuildRequires:  pkgconfig(capi-base-common)
 BuildRequires:  pkgconfig(capi-media-sound-manager)
 BuildRequires:  pkgconfig(gstreamer-0.10)
-BuildRequires:  pkgconfig(mm-ta)
 BuildRequires:  pkgconfig(appcore-efl)
 BuildRequires:  pkgconfig(elementary)
 BuildRequires:  pkgconfig(ecore)
 BuildRequires:  pkgconfig(evas)
 BuildRequires:  pkgconfig(ecore-x)
+BuildRequires:  pkgconfig(capi-media-tool)
+BuildRequires:  pkgconfig(libtbm)
 
 Requires(post): /sbin/ldconfig
 Requires(postun): /sbin/ldconfig
@@ -41,41 +37,38 @@ Requires: %{name} = %{version}-%{release}
 
 
 %build
-%if 0%{?tizen_profile_wearable}
-cd wearable
-%else
-cd mobile
+%if 0%{?sec_build_binary_debug_enable}
+export CFLAGS="$CFLAGS -DTIZEN_DEBUG_ENABLE"
+#export CFLAGS+=" -D_USE_X_DIRECT_"
+export CXXFLAGS="$CXXFLAGS -DTIZEN_DEBUG_ENABLE"
+export FFLAGS="$FFLAGS -DTIZEN_DEBUG_ENABLE"
 %endif
 MAJORVER=`echo %{version} | awk 'BEGIN {FS="."}{print $1}'`
-%cmake . -DFULLVER=%{version} -DMAJORVER=${MAJORVER}
+cmake . -DCMAKE_INSTALL_PREFIX=/usr -DFULLVER=%{version} -DMAJORVER=${MAJORVER}
 
 
 make %{?jobs:-j%jobs}
 
 %install
-%if 0%{?tizen_profile_wearable}
-cd wearable
-%else
-cd mobile
-%endif
 rm -rf %{buildroot}
 mkdir -p %{buildroot}/usr/share/license
+mkdir -p %{buildroot}/opt/usr/devel
 cp LICENSE.APLv2 %{buildroot}/usr/share/license/%{name}
+cp test/player_test %{buildroot}/opt/usr/devel
+
 %make_install
 
-%post -p /sbin/ldconfig
+%post
+/sbin/ldconfig
 
 %postun -p /sbin/ldconfig
 
 
 %files
-%if 0%{?tizen_profile_wearable}
-%manifest wearable/capi-media-player.manifest
-%else
-%manifest mobile/capi-media-player.manifest
-%endif
+%manifest capi-media-player.manifest
 %{_libdir}/libcapi-media-player.so.*
 %{_datadir}/license/%{name}
+/opt/usr/devel/*
 
 %files devel
 %{_includedir}/media/*.h
