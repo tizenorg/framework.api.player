@@ -19,53 +19,82 @@
 #include <string.h>
 #include <mm.h>
 #include <mm_player.h>
-#include <mm_player_sndeffect.h>
+#include <mm_player_audioeffect.h>
 #include <mm_player_internal.h>
 #include <mm_types.h>
 #include <player.h>
 #include <player_private.h>
 #include <dlog.h>
-#include <mm_ta.h>
+#include <Evas.h>
+#include <Ecore.h>
+#include <Elementary.h>
+#include <Ecore.h>
+#include <tbm_bufmgr.h>
+#include <tbm_surface_internal.h>
+#include <gst/gst.h>
 
-#ifdef LOG_TAG
-#undef LOG_TAG
-#endif
-#define LOG_TAG "TIZEN_N_PLAYER"
+#define __JOB_KEY_PREPARED		"prepared"
+#define __JOB_KEY_ERROR		"error"
+#define __JOB_KEY_SEEK_DONE	"seek_done"
+#define __JOB_KEY_EOS			"eos"
 
-/*
-* Internal Macros
-*/
+#define __RELEASEIF_PREPARE_THREAD(thread_id) \
+	do { \
+		if (thread_id) \
+		{ \
+			pthread_join(thread_id, NULL); \
+			thread_id = 0; \
+			LOGI("prepare thread released\n"); \
+		} \
+	}while(0)
 
-#define PLAYER_CHECK_CONDITION(condition,error,msg)	\
-		if(condition) {} else \
-		{ LOGE("[%s] %s(0x%08x)",__FUNCTION__, msg,error); return error;}; \
+#define __DELETE_ECORE_ITEM(ecore_job) \
+	do { \
+		if (ecore_job) \
+		{ \
+			ecore_job_del(ecore_job); \
+			ecore_job = NULL; \
+		} \
+	}while(0)
 
+#define	__ADD_ECORE_JOB(handle, key, job_callback)	\
+	do \
+	{	\
+		Ecore_Job *job = NULL; \
+		job = ecore_job_add(job_callback, (void *)handle); \
+		LOGI("adding %s job - %p\n", key, job); \
+		g_hash_table_insert(handle->ecore_jobs, g_strdup(key), job); \
+	\
+	} while(0)
 
-#define PLAYER_INSTANCE_CHECK(player)	\
-	PLAYER_CHECK_CONDITION(player != NULL, PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER")
-	
-#define PLAYER_STATE_CHECK(player,expected_state)	\
-	PLAYER_CHECK_CONDITION(player->state == expected_state,PLAYER_ERROR_INVALID_STATE,"PLAYER_ERROR_INVALID_STATE")
-
-#define PLAYER_NULL_ARG_CHECK(arg)	\
-	PLAYER_CHECK_CONDITION(arg != NULL,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER")
+#define __REMOVE_ECORE_JOB(handle, job_key) \
+	do \
+	{	\
+		LOGI("%s done so, remove\n", job_key); \
+		g_hash_table_remove(handle->ecore_jobs, job_key); \
+		handle->is_doing_jobs = FALSE;	\
+	} while(0)
 
 /*
 * Internal Implementation
 */
-static int __convert_error_code(int code, char* func_name)
+int __player_convert_error_code(int code, char* func_name)
 {
-	int ret = PLAYER_ERROR_NONE;
-	char* msg="PLAYER_ERROR_NONE";
+	int ret = PLAYER_ERROR_INVALID_OPERATION;
+	char* msg="PLAYER_ERROR_INVALID_OPERATION";
 	switch(code)
 	{
 		case MM_ERROR_NONE:
+		case MM_ERROR_PLAYER_AUDIO_CODEC_NOT_FOUND:
+		case MM_ERROR_PLAYER_VIDEO_CODEC_NOT_FOUND:
 			ret = PLAYER_ERROR_NONE;
 			msg = "PLAYER_ERROR_NONE";
 			break;
+		case MM_ERROR_INVALID_ARGUMENT:
+			ret = PLAYER_ERROR_INVALID_PARAMETER;
+			msg = "PLAYER_ERROR_INVALID_PARAMETER";
+			break;
 		case MM_ERROR_PLAYER_CODEC_NOT_FOUND:
-		case MM_ERROR_PLAYER_AUDIO_CODEC_NOT_FOUND:
-		case MM_ERROR_PLAYER_VIDEO_CODEC_NOT_FOUND:
 		case MM_ERROR_PLAYER_STREAMING_UNSUPPORTED_AUDIO:
 		case MM_ERROR_PLAYER_STREAMING_UNSUPPORTED_VIDEO:
 		case MM_ERROR_PLAYER_STREAMING_UNSUPPORTED_MEDIA_TYPE:
@@ -82,17 +111,18 @@ static int __convert_error_code(int code, char* func_name)
 		case MM_ERROR_PLAYER_INVALID_STREAM:
 		case MM_ERROR_PLAYER_STREAMING_FAIL:
 		case MM_ERROR_PLAYER_NO_OP:
-		case MM_ERROR_NOT_SUPPORT_API:
 			ret = PLAYER_ERROR_INVALID_OPERATION;
 			msg = "PLAYER_ERROR_INVALID_OPERATION";
 			break;
+		case MM_ERROR_PLAYER_SOUND_EFFECT_INVALID_STATUS:
+		case MM_ERROR_NOT_SUPPORT_API:
 		case MM_ERROR_PLAYER_SOUND_EFFECT_NOT_SUPPORTED_FILTER:
-			ret = PLAYER_ERROR_INVALID_OPERATION;
-			msg = "PLAYER_ERROR_INVALID_OPERATION (NOT SUPPORTED AUDIO EFFECT)";
+			ret =PLAYER_ERROR_FEATURE_NOT_SUPPORTED_ON_DEVICE;
+			msg = "PLAYER_ERROR_FEATURE_NOT_SUPPORTED_ON_DEVICE";
 			break;
 		case  MM_ERROR_PLAYER_NO_FREE_SPACE:
-			ret = PLAYER_ERROR_OUT_OF_MEMORY;
-			msg = "PLAYER_ERROR_OUT_OF_MEMORY";
+			ret = PLAYER_ERROR_FILE_NO_SPACE_ON_DEVICE;
+			msg = "PLAYER_ERROR_FILE_NO_SPACE_ON_DEVICE";
 			break;
 		case MM_ERROR_PLAYER_FILE_NOT_FOUND:
 			ret = PLAYER_ERROR_NO_SUCH_FILE;
@@ -156,9 +186,226 @@ static int __convert_error_code(int code, char* func_name)
 			ret = PLAYER_ERROR_SOUND_POLICY;
 			msg = "PLAYER_ERROR_SOUND_POLICY";
 			break;
+		case MM_ERROR_PLAYER_DRM_EXPIRED:
+			ret = PLAYER_ERROR_DRM_EXPIRED;
+			msg = "PLAYER_ERROR_DRM_EXPIRED";
+			break;
+		case MM_ERROR_PLAYER_DRM_NOT_AUTHORIZED:
+		case MM_ERROR_PLAYER_DRM_NO_LICENSE:
+			ret = PLAYER_ERROR_DRM_NO_LICENSE;
+			msg = "PLAYER_ERROR_DRM_NO_LICENSE";
+			break;
+		case MM_ERROR_PLAYER_DRM_FUTURE_USE:
+			ret = PLAYER_ERROR_DRM_FUTURE_USE;
+			msg = "PLAYER_ERROR_DRM_FUTURE_USE";
+			break;
+		case MM_ERROR_PLAYER_DRM_OUTPUT_PROTECTION:
+			ret = PLAYER_ERROR_DRM_NOT_PERMITTED;
+			msg = "PLAYER_ERROR_DRM_NOT_PERMITTED";
+			break;
+		case MM_ERROR_PLAYER_RESOURCE_LIMIT:
+			ret = PLAYER_ERROR_RESOURCE_LIMIT;
+			msg = "PLAYER_ERROR_RESOURCE_LIMIT";
+			break;
+		case MM_ERROR_PLAYER_PERMISSION_DENIED:
+			ret = PLAYER_ERROR_PERMISSION_DENIED;
+			msg = "PLAYER_ERROR_PERMISSION_DENIED";
 	}
 	LOGE("[%s] %s(0x%08x) : core fw error(0x%x)",func_name,msg, ret, code);
-	return ret;	
+	return ret;
+}
+
+int _player_get_tbm_surface_format(int in_format, uint32_t *out_format)
+{
+	if (in_format <= MM_PIXEL_FORMAT_INVALID ||
+	    in_format >= MM_PIXEL_FORMAT_NUM ||
+	    out_format == NULL) {
+		LOGE("INVALID_PARAMETER : in_format %d, out_format ptr %p", in_format, out_format);
+		return PLAYER_ERROR_INVALID_PARAMETER;
+	}
+
+	switch (in_format) {
+	case MM_PIXEL_FORMAT_NV12:
+	case MM_PIXEL_FORMAT_NV12T:
+		*out_format = TBM_FORMAT_NV12;
+		break;
+	case MM_PIXEL_FORMAT_NV16:
+		*out_format = TBM_FORMAT_NV16;
+		break;
+	case MM_PIXEL_FORMAT_NV21:
+		*out_format = TBM_FORMAT_NV21;
+		break;
+	case MM_PIXEL_FORMAT_YUYV:
+		*out_format = TBM_FORMAT_YUYV;
+		break;
+	case MM_PIXEL_FORMAT_UYVY:
+	case MM_PIXEL_FORMAT_ITLV_JPEG_UYVY:
+		*out_format = TBM_FORMAT_UYVY;
+		break;
+	case MM_PIXEL_FORMAT_422P:
+		*out_format = TBM_FORMAT_YUV422;
+		break;
+	case MM_PIXEL_FORMAT_I420:
+		*out_format = TBM_FORMAT_YUV420;
+		break;
+	case MM_PIXEL_FORMAT_YV12:
+		*out_format = TBM_FORMAT_YVU420;
+		break;
+	case MM_PIXEL_FORMAT_RGB565:
+		*out_format = TBM_FORMAT_RGB565;
+		break;
+	case MM_PIXEL_FORMAT_RGB888:
+		*out_format = TBM_FORMAT_RGB888;
+		break;
+	case MM_PIXEL_FORMAT_RGBA:
+		*out_format = TBM_FORMAT_RGBA8888;
+		break;
+	case MM_PIXEL_FORMAT_ARGB:
+		*out_format = TBM_FORMAT_ARGB8888;
+		break;
+	default:
+		LOGE("invalid in_format %d", in_format);
+		return PLAYER_ERROR_INVALID_PARAMETER;
+	}
+
+	return PLAYER_ERROR_NONE;
+}
+
+int _player_get_media_packet_mimetype(int in_format, media_format_mimetype_e *mimetype)
+{
+	if (in_format <= MM_PIXEL_FORMAT_INVALID ||
+	    in_format >= MM_PIXEL_FORMAT_NUM ||
+	    mimetype == NULL) {
+		LOGE("INVALID_PARAMETER : in_format %d, mimetype ptr %p", in_format, mimetype);
+		return PLAYER_ERROR_INVALID_PARAMETER;
+	}
+
+	switch (in_format) {
+	case MM_PIXEL_FORMAT_NV12:
+	case MM_PIXEL_FORMAT_NV12T:
+		*mimetype = MEDIA_FORMAT_NV12;
+		break;
+	case MM_PIXEL_FORMAT_NV16:
+		*mimetype = MEDIA_FORMAT_NV16;
+		break;
+	case MM_PIXEL_FORMAT_NV21:
+		*mimetype = MEDIA_FORMAT_NV21;
+		break;
+	case MM_PIXEL_FORMAT_YUYV:
+		*mimetype = MEDIA_FORMAT_YUYV;
+		break;
+	case MM_PIXEL_FORMAT_UYVY:
+	case MM_PIXEL_FORMAT_ITLV_JPEG_UYVY:
+		*mimetype = MEDIA_FORMAT_UYVY;
+		break;
+	case MM_PIXEL_FORMAT_422P:
+		*mimetype = MEDIA_FORMAT_422P;
+		break;
+	case MM_PIXEL_FORMAT_I420:
+		*mimetype = MEDIA_FORMAT_I420;
+		break;
+	case MM_PIXEL_FORMAT_YV12:
+		*mimetype = MEDIA_FORMAT_YV12;
+		break;
+	case MM_PIXEL_FORMAT_RGB565:
+		*mimetype = MEDIA_FORMAT_RGB565;
+		break;
+	case MM_PIXEL_FORMAT_RGB888:
+		*mimetype = MEDIA_FORMAT_RGB888;
+		break;
+	case MM_PIXEL_FORMAT_RGBA:
+		*mimetype = MEDIA_FORMAT_RGBA;
+		break;
+	case MM_PIXEL_FORMAT_ARGB:
+		*mimetype = MEDIA_FORMAT_ARGB;
+		break;
+	default:
+		LOGE("invalid in_format %d", in_format);
+		return PLAYER_ERROR_INVALID_PARAMETER;
+	}
+
+	return PLAYER_ERROR_NONE;
+}
+
+int _player_media_packet_finalize(media_packet_h pkt, int error_code, void *user_data)
+{
+	int ret = 0;
+	void *internal_buffer = NULL;
+	tbm_surface_h tsurf = NULL;
+
+	if (pkt == NULL || user_data == NULL) {
+		LOGE("invalid parameter buffer %p, user_data %p", pkt, user_data);
+		return MEDIA_PACKET_FINALIZE;
+	}
+
+	ret = media_packet_get_extra(pkt, &internal_buffer);
+	if (ret != MEDIA_PACKET_ERROR_NONE) {
+		LOGE("media_packet_get_extra failed 0x%x", ret);
+		return MEDIA_PACKET_FINALIZE;
+	}
+
+	/*LOGD("pointer gst buffer %p, ret 0x%x", internal_buffer, ret);*/
+
+	if (internal_buffer) {
+		gst_buffer_unref((GstBuffer *)internal_buffer);
+		internal_buffer = NULL;
+	}
+
+	ret = media_packet_get_tbm_surface(pkt, &tsurf);
+	if (ret != MEDIA_PACKET_ERROR_NONE) {
+		LOGE("media_packet_get_tbm_surface failed 0x%x", ret);
+		return MEDIA_PACKET_FINALIZE;
+	 }
+
+	if (tsurf) {
+		tbm_surface_destroy(tsurf);
+		 tsurf = NULL;
+	}
+
+	return MEDIA_PACKET_FINALIZE;
+}
+
+static bool _player_network_availability_check()
+{
+	#define _FEATURE_NAME_WIFI 		"http://tizen.org/feature/network.wifi"
+	#define _FEATURE_NAME_TELEPHONY "http://tizen.org/feature/network.telephony"
+	#define _FEATURE_NAME_ETHERNET	"http://tizen.org/feature/network.ethernet"
+	bool enabled = FALSE;
+	bool supported = FALSE;
+
+	if (SYSTEM_INFO_ERROR_NONE == system_info_get_platform_bool(_FEATURE_NAME_WIFI, &enabled))
+	{
+		LOGI("wifi status = %d", enabled);
+		if (enabled) supported = TRUE;
+	}
+	else
+	{
+		LOGE("SYSTEM_INFO_ERROR");
+	}
+
+	if (SYSTEM_INFO_ERROR_NONE == system_info_get_platform_bool(_FEATURE_NAME_TELEPHONY, &enabled))
+	{
+		LOGI("telephony status = %d", enabled);
+		if (enabled) supported = TRUE;
+	}
+	else
+	{
+		LOGE("SYSTEM_INFO_ERROR");
+	}
+
+	if (SYSTEM_INFO_ERROR_NONE == system_info_get_platform_bool(_FEATURE_NAME_ETHERNET, &enabled))
+	{
+		LOGI("ethernet status = %d", enabled);
+		if (enabled) supported = TRUE;
+	}
+	else
+	{
+		LOGE("SYSTEM_INFO_ERROR");
+	}
+
+	if (!supported) return FALSE;
+
+	return TRUE;
 }
 
 static player_interrupted_code_e __convert_interrupted_code(int code)
@@ -166,25 +413,37 @@ static player_interrupted_code_e __convert_interrupted_code(int code)
 	player_interrupted_code_e ret = PLAYER_INTERRUPTED_BY_RESOURCE_CONFLICT;
 	switch(code)
 	{
-		case MM_MSG_CODE_INTERRUPTED_BY_OTHER_APP:
-			ret = PLAYER_INTERRUPTED_BY_OTHER_APP;
+		case MM_MSG_CODE_INTERRUPTED_BY_CALL_END:
+		case MM_MSG_CODE_INTERRUPTED_BY_ALARM_END:
+		case MM_MSG_CODE_INTERRUPTED_BY_EMERGENCY_END:
+		case MM_MSG_CODE_INTERRUPTED_BY_NOTIFICATION_END:
+			ret = PLAYER_INTERRUPTED_COMPLETED;
+			break;
+		case MM_MSG_CODE_INTERRUPTED_BY_MEDIA:
+		case MM_MSG_CODE_INTERRUPTED_BY_OTHER_PLAYER_APP:
+			ret = PLAYER_INTERRUPTED_BY_MEDIA;
 			break;
 		case MM_MSG_CODE_INTERRUPTED_BY_CALL_START:
-		case PLAYER_INTERRUPTED_BY_CALL:
-			ret = PLAYER_INTERRUPTED_BY_OTHER_APP;
+			ret = PLAYER_INTERRUPTED_BY_CALL;
 			break;
 		case MM_MSG_CODE_INTERRUPTED_BY_EARJACK_UNPLUG:
 			ret = PLAYER_INTERRUPTED_BY_EARJACK_UNPLUG;
 			break;
 		case MM_MSG_CODE_INTERRUPTED_BY_ALARM_START:
-		case MM_MSG_CODE_INTERRUPTED_BY_ALARM_END:
 			ret = PLAYER_INTERRUPTED_BY_ALARM;
+			break;
+		case MM_MSG_CODE_INTERRUPTED_BY_NOTIFICATION_START:
+			ret = PLAYER_INTERRUPTED_BY_NOTIFICATION;
+			break;
+		case MM_MSG_CODE_INTERRUPTED_BY_EMERGENCY_START:
+			ret = PLAYER_INTERRUPTED_BY_EMERGENCY;
 			break;
 		case MM_MSG_CODE_INTERRUPTED_BY_RESOURCE_CONFLICT:
 		default :
 			ret = PLAYER_INTERRUPTED_BY_RESOURCE_CONFLICT;
 			break;
 	}
+	LOGE("[%s] interrupted code(%d) => ret(%d)",__FUNCTION__,code, ret);
 	return ret;
 }
 
@@ -196,7 +455,7 @@ static player_state_e __convert_player_state(MMPlayerStateType state)
 		return state +1;
 }
 
-static bool __player_state_validate(player_s * handle, player_state_e threshold)
+bool __player_state_validate(player_s * handle, player_state_e threshold)
 {
 	if (handle->state < threshold)
 		return FALSE;
@@ -207,6 +466,12 @@ static int __set_callback(_player_event_e type, player_h player, void* callback,
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(callback);
+	if (_PLAYER_EVENT_TYPE_BUFFERING == type)
+	{
+		if (!_player_network_availability_check())
+		return PLAYER_ERROR_FEATURE_NOT_SUPPORTED_ON_DEVICE;
+	}
+
 	player_s * handle = (player_s *) player;
 	handle->user_cb[type] = callback;
 	handle->user_data[type] = user_data;
@@ -224,24 +489,72 @@ static int __unset_callback(_player_event_e type, player_h player)
 	return PLAYER_ERROR_NONE;
 }
 
+static void __job_prepared_cb(void *user_data)
+{
+	player_s * handle = (player_s*)user_data;
+	LOGI("Start");
+	handle->is_doing_jobs = TRUE;
+	handle->state = PLAYER_STATE_READY;
+	((player_prepared_cb)handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE])(handle->user_data[_PLAYER_EVENT_TYPE_PREPARE]);
+	handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
+	handle->user_data[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
+	__REMOVE_ECORE_JOB(handle, __JOB_KEY_PREPARED);
+	LOGI("End");
+}
+
+static void __job_error_cb(void *user_data)
+{
+	player_s * handle = (player_s*)user_data;
+	LOGI("Start");
+	handle->is_doing_jobs = TRUE;
+	((player_error_cb)handle->user_cb[_PLAYER_EVENT_TYPE_ERROR])(handle->error_code,handle->user_data[_PLAYER_EVENT_TYPE_ERROR]);
+	__REMOVE_ECORE_JOB(handle, __JOB_KEY_ERROR);
+	LOGI("End");
+}
+
+static void __job_seek_done_cb(void *user_data)
+{
+	player_s * handle = (player_s*)user_data;
+	LOGI("Start");
+	handle->is_doing_jobs = TRUE;
+	((player_seek_completed_cb)handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])(handle->user_data[_PLAYER_EVENT_TYPE_SEEK]);
+	handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+	handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+	__REMOVE_ECORE_JOB(handle, __JOB_KEY_SEEK_DONE);
+	LOGI("End");
+}
+
+static void __job_eos_cb(void *user_data)
+{
+	player_s * handle = (player_s*)user_data;
+	LOGI("Start");
+	handle->is_doing_jobs = TRUE;
+	((player_completed_cb)handle->user_cb[_PLAYER_EVENT_TYPE_COMPLETE])(handle->user_data[_PLAYER_EVENT_TYPE_COMPLETE]);
+	__REMOVE_ECORE_JOB(handle, __JOB_KEY_EOS);
+	LOGI("End");
+}
+
 static int __msg_callback(int message, void *param, void *user_data)
 {
 	player_s * handle = (player_s*)user_data;
 	MMMessageParamType *msg = (MMMessageParamType*)param;
-	LOGI("[%s] Start : Got message type : 0x%x" ,__FUNCTION__, message);
+	LOGW("[%s] Got message type : 0x%x" ,__FUNCTION__, message);
 	player_error_e err_code = PLAYER_ERROR_NONE;
 	switch(message)
 	{
 		case MM_MESSAGE_ERROR: //0x01
-			err_code = __convert_error_code(msg->code,(char*)__FUNCTION__);
+			err_code = __player_convert_error_code(msg->code,(char*)__FUNCTION__);
 			break;
 		case  MM_MESSAGE_STATE_CHANGED:	//0x03
-			LOGE("STATE CHANGED INTERNALLY - from : %d,  to : %d (CAPI State : %d)", msg->state.previous, msg->state.current, handle->state);
-
-			if(handle->state == PLAYER_STATE_PLAYING && msg->state.current == MM_PLAYER_STATE_PAUSED &&  handle->user_cb[_PLAYER_EVENT_TYPE_PAUSE] )
+			LOGI("STATE CHANGED INTERNALLY - from : %d,  to : %d (CAPI State : %d)", msg->state.previous, msg->state.current, handle->state);
+			if ((handle->is_progressive_download && msg->state.previous == MM_PLAYER_STATE_NULL && msg->state.current == MM_PLAYER_STATE_READY) ||
+				(msg->state.previous == MM_PLAYER_STATE_READY && msg->state.current == MM_PLAYER_STATE_PAUSED))
 			{
-				LOGE("[%s] Invoke the paused callback", __FUNCTION__);
-				((player_paused_cb)handle->user_cb[_PLAYER_EVENT_TYPE_PAUSE])(handle->user_data[_PLAYER_EVENT_TYPE_PAUSE]);
+				if(handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE]) // asyc && prepared cb has been set
+				{
+					LOGI("[%s] Prepared! [current state : %d]", __FUNCTION__, handle->state);
+					__ADD_ECORE_JOB(handle, __JOB_KEY_PREPARED, __job_prepared_cb);
+				}
 			}
 			break;
 		case MM_MESSAGE_READY_TO_RESUME: //0x05
@@ -251,39 +564,13 @@ static int __msg_callback(int message, void *param, void *user_data)
 			}
 			break;
 		case MM_MESSAGE_BEGIN_OF_STREAM: //0x104
-			if(handle->is_prepare_sync)//sync && started cb has been set
-			{
-				if(handle->user_cb[_PLAYER_EVENT_TYPE_BEGIN])
-				{
-					MMTA_ACUM_ITEM_END("[CAPI] player_start ~ BOS", 0);
-					((player_started_cb)handle->user_cb[_PLAYER_EVENT_TYPE_BEGIN])(handle->user_data[_PLAYER_EVENT_TYPE_BEGIN]);
-				}
-			}
-			else
-			{
-				if(handle->state!=PLAYER_STATE_IDLE)
-				{
-					LOGE("[%s] Nothing to happen in BOS [current state : %d] - (prepared_cb should be called when user invoke prepare()).  ", __FUNCTION__, handle->state);
-				}
-				else
-				{
-					handle->state=PLAYER_STATE_READY;
-					if(handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE]) // asyc && prepared cb has been set
-					{
-						mm_player_pause(handle->mm_handle);
-						mm_player_set_mute(handle->mm_handle,0);
-						((player_prepared_cb)handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE])(handle->user_data[_PLAYER_EVENT_TYPE_PREPARE]);
-						handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
-						handle->user_data[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
-					}
-				}
-			}
+				LOGI("[%s] Ready to streaming information (BOS) [current state : %d]", __FUNCTION__, handle->state);
 			break;
 		case MM_MESSAGE_END_OF_STREAM://0x105
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_COMPLETE] )
 			{
-				((player_completed_cb)handle->user_cb[_PLAYER_EVENT_TYPE_COMPLETE])(handle->user_data[_PLAYER_EVENT_TYPE_COMPLETE]);
-			}	
+				__ADD_ECORE_JOB(handle, __JOB_KEY_EOS, __job_eos_cb);
+			}
 			break;
 		case MM_MESSAGE_BUFFERING: //0x103
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_BUFFERING] )
@@ -295,25 +582,29 @@ static int __msg_callback(int message, void *param, void *user_data)
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_INTERRUPT] )
 			{
 				handle->state = __convert_player_state(msg->state.current);
+				if (handle->state == PLAYER_STATE_READY)
+				{
+					handle->is_stopped = TRUE;
+				}
 				((player_interrupted_cb)handle->user_cb[_PLAYER_EVENT_TYPE_INTERRUPT])(__convert_interrupted_code(msg->code),handle->user_data[_PLAYER_EVENT_TYPE_INTERRUPT]);
 			}
 			break;
 		case MM_MESSAGE_CONNECTION_TIMEOUT: //0x102
-			LOGE("[%s] PLAYER_ERROR_CONNECTION_FAILED (0x%08x) : CONNECTION_TIMEOUT" ,__FUNCTION__, PLAYER_ERROR_CONNECTION_FAILED);
+			LOGI("[%s] PLAYER_ERROR_CONNECTION_FAILED (0x%08x) : CONNECTION_TIMEOUT" ,__FUNCTION__, PLAYER_ERROR_CONNECTION_FAILED);
 			err_code = PLAYER_ERROR_CONNECTION_FAILED;
 			break;
 		case MM_MESSAGE_UPDATE_SUBTITLE: //0x109
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_SUBTITLE] )
 			{
 				((player_subtitle_updated_cb)handle->user_cb[_PLAYER_EVENT_TYPE_SUBTITLE])(msg->subtitle.duration, (char*)msg->data,handle->user_data[_PLAYER_EVENT_TYPE_SUBTITLE]);
-			}	
+			}
 			break;
 		case MM_MESSAGE_VIDEO_NOT_CAPTURED: //0x113
-			LOGE("[%s] PLAYER_ERROR_VIDEO_CAPTURE_FAILED (0x%08x)",__FUNCTION__, PLAYER_ERROR_VIDEO_CAPTURE_FAILED);
+			LOGI("[%s] PLAYER_ERROR_VIDEO_CAPTURE_FAILED (0x%08x)",__FUNCTION__, PLAYER_ERROR_VIDEO_CAPTURE_FAILED);
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_ERROR] )
 			{
 				((player_error_cb)handle->user_cb[_PLAYER_EVENT_TYPE_ERROR])(PLAYER_ERROR_VIDEO_CAPTURE_FAILED,handle->user_data[_PLAYER_EVENT_TYPE_ERROR]);
-			}	
+			}
 			break;
 		case MM_MESSAGE_VIDEO_CAPTURED: //0x110
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_CAPTURE] )
@@ -329,6 +620,30 @@ static int __msg_callback(int message, void *param, void *user_data)
 				else
 				{
 					MMPlayerVideoCapture* capture = (MMPlayerVideoCapture *)msg->data;
+
+					switch ( msg->captured_frame.orientation )
+					{
+						case 0:
+						case 180:
+						{
+							/* use video resolution from above */
+						}
+						break;
+						case 90:
+						case 270:
+						{
+							/* use calculated size during rotation */
+							w = msg->captured_frame.width;
+							h = msg->captured_frame.height;
+						}
+						break;
+						default:
+						break;
+					}
+
+					LOGI("[%s] captured image width : %d   height : %d", __FUNCTION__, w, h);
+
+					/* call application callback */
 					((player_video_captured_cb)handle->user_cb[_PLAYER_EVENT_TYPE_CAPTURE])(capture->data, w, h, capture->size, handle->user_data[_PLAYER_EVENT_TYPE_CAPTURE]);
 
 					if (capture->data)
@@ -339,26 +654,25 @@ static int __msg_callback(int message, void *param, void *user_data)
 				}
 				handle->user_cb[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
 				handle->user_data[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
-			}	
-			break;	
+			}
+			break;
 		case MM_MESSAGE_FILE_NOT_SUPPORTED: //0x10f
-			LOGE("[%s] PLAYER_ERROR_NOT_SUPPORTED_FILE (0x%08x) : FILE_NOT_SUPPORTED" ,__FUNCTION__, PLAYER_ERROR_NOT_SUPPORTED_FILE);
+			LOGI("[%s] PLAYER_ERROR_NOT_SUPPORTED_FILE (0x%08x) : FILE_NOT_SUPPORTED" ,__FUNCTION__, PLAYER_ERROR_NOT_SUPPORTED_FILE);
 			err_code = PLAYER_ERROR_NOT_SUPPORTED_FILE;
 			break;
 		case MM_MESSAGE_FILE_NOT_FOUND: //0x110
-			LOGE("[%s] PLAYER_ERROR_NOT_SUPPORTED_FILE (0x%08x) : FILE_NOT_FOUND" ,__FUNCTION__, PLAYER_ERROR_NOT_SUPPORTED_FILE);
-			err_code = PLAYER_ERROR_NOT_SUPPORTED_FILE;
-			break;
-		case MM_MESSAGE_DRM_NOT_AUTHORIZED: //0x111
-			LOGE("[%s] PLAYER_ERROR_NOT_SUPPORTED_FILE (0x%08x) : DRM_NOT_AUTHORIZED" ,__FUNCTION__, PLAYER_ERROR_NOT_SUPPORTED_FILE);
+			LOGI("[%s] PLAYER_ERROR_NOT_SUPPORTED_FILE (0x%08x) : FILE_NOT_FOUND" ,__FUNCTION__, PLAYER_ERROR_NOT_SUPPORTED_FILE);
 			err_code = PLAYER_ERROR_NOT_SUPPORTED_FILE;
 			break;
 		case MM_MESSAGE_SEEK_COMPLETED: //0x114
+			if (handle->display_type != ((int)MM_DISPLAY_SURFACE_NULL) && handle->state == PLAYER_STATE_READY)
+			{
+				if(handle->is_display_visible)
+					mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 1, (char*)NULL);
+			}
 			if( handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
 			{
-				((player_seek_completed_cb)handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])(handle->user_data[_PLAYER_EVENT_TYPE_SEEK]);
-				handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
-				handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+				__ADD_ECORE_JOB(handle, __JOB_KEY_SEEK_DONE, __job_seek_done_cb);
 			}
 			break;
 		case MM_MESSAGE_UNKNOWN: //0x00
@@ -367,7 +681,6 @@ static int __msg_callback(int message, void *param, void *user_data)
 		case MM_MESSAGE_CONNECTED: //0x101
 		case MM_MESSAGE_BLUETOOTH_ON: //0x106
 		case MM_MESSAGE_BLUETOOTH_OFF: //0x107
-		case MM_MESSAGE_RESUMED_BY_REW: //0x108
 		case MM_MESSAGE_RTP_SENDER_REPORT: //0x10a
 		case MM_MESSAGE_RTP_RECEIVER_REPORT: //0x10b
 		case MM_MESSAGE_RTP_SESSION_STATUS: //0x10c
@@ -379,35 +692,161 @@ static int __msg_callback(int message, void *param, void *user_data)
 
 	if(err_code != PLAYER_ERROR_NONE && handle->user_cb[_PLAYER_EVENT_TYPE_ERROR])
 	{
-		((player_error_cb)handle->user_cb[_PLAYER_EVENT_TYPE_ERROR])(err_code,handle->user_data[_PLAYER_EVENT_TYPE_ERROR]);
+		handle->error_code = err_code;
+		__ADD_ECORE_JOB(handle, __JOB_KEY_ERROR, __job_error_cb);
 	}
-	LOGE("[%s] End", __FUNCTION__);
+	LOGW("[%s] End", __FUNCTION__);
 	return 1;
 }
 
-static bool  __video_stream_callback(void *stream, int stream_size, void *user_data, int width, int height)
+static bool  __video_stream_callback(void *stream, void *user_data)
 {
 	player_s * handle = (player_s*)user_data;
-	if( handle->user_cb[_PLAYER_EVENT_TYPE_VIDEO_FRAME])
-	{
-		if(handle->state==PLAYER_STATE_PLAYING)
-			((player_video_frame_decoded_cb)handle->user_cb[_PLAYER_EVENT_TYPE_VIDEO_FRAME])((unsigned char *)stream, width, height, stream_size, handle->user_data[_PLAYER_EVENT_TYPE_VIDEO_FRAME]);
-		else
-			LOGE("[%s] Skip stream - current state : %d", __FUNCTION__,handle->state);
-	}	
-	return TRUE;
-}
+	MMPlayerVideoStreamDataType *video_stream = (MMPlayerVideoStreamDataType *)stream;
 
-static bool  __audio_stream_callback(void *stream, int stream_size, void *user_data)
-{
-	player_s * handle = (player_s*)user_data;
-	if( handle->user_cb[_PLAYER_EVENT_TYPE_AUDIO_FRAME] )
+	if (handle->user_cb[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME]) // media packet and zero-copy
 	{
-		if(handle->state==PLAYER_STATE_PLAYING)
-			((player_audio_frame_decoded_cb)handle->user_cb[_PLAYER_EVENT_TYPE_AUDIO_FRAME])((unsigned char *)stream, stream_size, handle->user_data[_PLAYER_EVENT_TYPE_AUDIO_FRAME]);
-		else
-			LOGE("[%s] Skip stream - current state : %d", __FUNCTION__,handle->state);
-	}	
+		media_packet_h pkt = NULL;
+		tbm_surface_h tsurf = NULL;
+		uint32_t bo_format = 0;
+		int i;
+		int bo_num;
+		int ret = 0;
+		media_format_mimetype_e mimetype = MEDIA_FORMAT_NV12;
+		bool make_pkt_fmt = false;
+
+		/* create tbm surface */
+		for (i = 0, bo_num = 0 ; i < BUFFER_MAX_PLANE_NUM ; i++) {
+			if (video_stream->bo[i]) {
+				bo_num++;
+			}
+		}
+
+		/* get tbm surface format */
+		ret = _player_get_tbm_surface_format(video_stream->format, &bo_format);
+		ret |= _player_get_media_packet_mimetype(video_stream->format, &mimetype);
+
+		if (bo_num > 0 && ret == PLAYER_ERROR_NONE) {
+			tbm_surface_info_s info;
+			memset(&info, 0, sizeof(tbm_surface_info_s));
+			info.width = video_stream->width;
+			info.height = video_stream->height;
+			info.format = bo_format;
+			info.bpp = tbm_surface_internal_get_bpp(bo_format);
+			info.num_planes = tbm_surface_internal_get_num_planes(bo_format);
+			info.size = 0;
+			for(i = 0; i < info.num_planes; i++) {
+				info.planes[i].stride = video_stream->stride[i];
+				info.planes[i].size = video_stream->stride[i] * video_stream->elevation[i];
+				if(i < bo_num)
+					info.planes[i].offset = 0;
+				else
+					info.planes[i].offset = info.planes[i - 1].size;
+				info.size += info.planes[i].size;
+			}
+			tsurf = tbm_surface_internal_create_with_bos(&info ,
+					(tbm_bo *)video_stream->bo, bo_num);
+			/*LOGD("tbm surface %p", tsurf);*/
+		} else if (bo_num == 0) {
+			int plane_idx = 0;
+			tbm_surface_info_s tsuri;
+			unsigned char *ptr = video_stream->data;
+
+			if (!ptr) return TRUE;
+
+			tsurf = tbm_surface_create(video_stream->width, video_stream->height,  bo_format);
+			if (tsurf) {
+				/* map surface to set data */
+				if (tbm_surface_map (tsurf, TBM_SURF_OPTION_READ|TBM_SURF_OPTION_WRITE, &tsuri)) {
+					LOGE("tbm_surface_map failed");
+					return TRUE;
+				}
+
+				for ( plane_idx = 0; plane_idx < tsuri.num_planes; plane_idx++ ) {
+					memcpy(tsuri.planes[plane_idx].ptr, ptr, tsuri.planes[plane_idx].size);
+					ptr += tsuri.planes[plane_idx].size;
+				}
+			} else {
+				LOGW("tbm_surface_create failed");
+			}
+		}
+
+		if (tsurf) {
+			/* check media packet format */
+			if (handle->pkt_fmt) {
+				int pkt_fmt_width = 0;
+				int pkt_fmt_height = 0;
+				media_format_mimetype_e pkt_fmt_mimetype = MEDIA_FORMAT_NV12;
+
+				media_format_get_video_info(handle->pkt_fmt, &pkt_fmt_mimetype,
+						&pkt_fmt_width, &pkt_fmt_height, NULL, NULL);
+				if (pkt_fmt_mimetype != mimetype ||
+				    pkt_fmt_width != video_stream->width ||
+				    pkt_fmt_height != video_stream->height) {
+					LOGW("different format. current 0x%x, %dx%d, new 0x%x, %dx%d",
+					     pkt_fmt_mimetype, pkt_fmt_width, pkt_fmt_height, mimetype,
+						 video_stream->width, video_stream->height);
+					media_format_unref(handle->pkt_fmt);
+					handle->pkt_fmt = NULL;
+					make_pkt_fmt = true;
+				}
+			} else {
+				make_pkt_fmt = true;
+			}
+
+			/* create packet format */
+			if (make_pkt_fmt) {
+				LOGW("make new pkt_fmt - mimetype 0x%x, %dx%d", mimetype,
+						video_stream->width, video_stream->height);
+				ret = media_format_create(&handle->pkt_fmt);
+				if (ret == MEDIA_FORMAT_ERROR_NONE) {
+					ret = media_format_set_video_mime(handle->pkt_fmt, mimetype);
+					ret |= media_format_set_video_width(handle->pkt_fmt, video_stream->width);
+					ret |= media_format_set_video_height(handle->pkt_fmt, video_stream->height);
+					LOGW("media_format_set_video_mime,width,height ret : 0x%x", ret);
+				} else {
+					LOGW("media_format_create failed");
+				}
+			}
+
+			/* create media packet */
+			ret = media_packet_create_from_tbm_surface(handle->pkt_fmt, tsurf, (media_packet_finalize_cb)_player_media_packet_finalize, (void *)handle, &pkt);
+			if (ret != MEDIA_PACKET_ERROR_NONE) {
+				LOGE("media_packet_create_from_tbm_surface failed");
+
+				tbm_surface_destroy(tsurf);
+				tsurf = NULL;
+			}
+		} else {
+			LOGE("failed to create tbm surface %dx%d, format %d, bo_num %d",
+					video_stream->width, video_stream->height, video_stream->format, bo_num);
+		}
+
+		if (pkt) {
+			/*LOGD("media packet %p, internal buffer %p", pkt, stream->internal_buffer);*/
+
+			/* set internal buffer */
+			if (video_stream->internal_buffer)
+				ret = media_packet_set_extra(pkt, video_stream->internal_buffer);
+
+			if (ret != MEDIA_PACKET_ERROR_NONE) {
+				LOGE("media_packet_set_extra failed");
+
+				media_packet_destroy(pkt);
+				pkt = NULL;
+			} else {
+				/* increase ref count of gst buffer */
+				if (video_stream->internal_buffer)
+					gst_buffer_ref((GstBuffer *)video_stream->internal_buffer);
+
+				/* call media packet callback */
+				((player_media_packet_video_decoded_cb)handle->user_cb[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME])(pkt, handle->user_data[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME]);
+
+				if (bo_num == 0)
+					tbm_surface_unmap(tsurf);
+			}
+		}
+	}
 	return TRUE;
 }
 
@@ -433,39 +872,18 @@ static int __pd_message_callback(int message, void *param, void *user_data)
 	}
 	return 0;
 }
-
-static bool __supported_audio_effect_type (int  filter, int type, void *user_data)
+static void __job_key_to_remove(gpointer key)
 {
-	player_s * handle = (player_s*)user_data;
-	if(filter != MM_AUDIO_FILTER_TYPE_CUSTOM || type == MM_AUDIO_FILTER_CUSTOM_EQ)
-	{
-		LOGI("[%s] Skip invalid filter: %d or type : %d",__FUNCTION__, filter, type);
-		return TRUE;
-	}
-
-	if( handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE] )
-	{
-		return ((player_audio_effect_supported_effect_cb)handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE])(type, handle->user_data[_PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE]);
-	}
-	return FALSE;
+	LOGI("%s",key);
+	g_free(key);
 }
 
-static bool __supported_audio_effect_preset (int  filter, int type, void *user_data)
+static void __job_value_to_destroy(gpointer value)
 {
-	player_s * handle = (player_s*)user_data;
-	if(filter != MM_AUDIO_FILTER_TYPE_PRESET)
-	{
-		LOGI("[%s] Skip invalid filter: %d or type : %d",__FUNCTION__, filter, type);
-		return TRUE;
-	}
-
-	if( handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET] )
-	{
-		return ((player_audio_effect_supported_effect_cb)handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET])(type, handle->user_data[_PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET]);
-	}
-	return FALSE;
+	Ecore_Job *job = (Ecore_Job *)value;
+	LOGI("%p", job);
+	__DELETE_ECORE_ITEM(job);
 }
-
 
 /*
 * Public Implementation
@@ -473,10 +891,7 @@ static bool __supported_audio_effect_preset (int  filter, int type, void *user_d
 
 int player_create (player_h *player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
-	MMTA_INIT();
-	MMTA_ACUM_ITEM_BEGIN("[CAPI] player_create", 0);
 	player_s * handle;
 	handle = (player_s*)malloc( sizeof(player_s));
 	if (handle != NULL)
@@ -487,7 +902,6 @@ int player_create (player_h *player)
 		return PLAYER_ERROR_OUT_OF_MEMORY;
 	}
 	int ret = mm_player_create(&handle->mm_handle);
-	MMTA_ACUM_ITEM_END("[CAPI] player_create", 0);
 	if( ret != MM_ERROR_NONE)
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x)" ,__FUNCTION__,PLAYER_ERROR_INVALID_OPERATION);
@@ -501,21 +915,40 @@ int player_create (player_h *player)
 		*player = (player_h)handle;
 		handle->state = PLAYER_STATE_IDLE;
 		handle->display_type = MM_DISPLAY_SURFACE_NULL; // means DISPLAY_TYPE_NONE(3)
-		handle->second_display_type = MM_DISPLAY_SURFACE_NULL;
-		LOGE("[%s] End", __FUNCTION__);
+		handle->is_stopped=false;
+		handle->is_display_visible=true;
+		handle->ecore_jobs = g_hash_table_new_full(g_str_hash, g_str_equal, __job_key_to_remove, __job_value_to_destroy);
+		LOGI("[%s] new handle : %p", __FUNCTION__, *player);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-
 int player_destroy (player_h player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	LOGI("[%s] Start, handle to destroy : %p", __FUNCTION__, player);
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
-	MMTA_ACUM_ITEM_SHOW_RESULT_TO(MMTA_SHOW_FILE);
+	if (handle->is_doing_jobs)
+	{
+		LOGE("jobs not completed. can't do destroy");
+		return PLAYER_ERROR_INVALID_OPERATION;
+	}
 
-	if (mm_player_destroy(handle->mm_handle)!= MM_ERROR_NONE)
+	g_hash_table_remove_all(handle->ecore_jobs);
+	g_hash_table_unref(handle->ecore_jobs);
+
+	__RELEASEIF_PREPARE_THREAD(handle->prepare_async_thread);
+
+	int ret = mm_player_destroy(handle->mm_handle);
+
+	if (handle->pkt_fmt) {
+		media_format_unref(handle->pkt_fmt);
+		handle->pkt_fmt = NULL;
+	}
+
+	LOGI("[%s] Done mm_player_destroy", __FUNCTION__);
+
+	if (ret != MM_ERROR_NONE)
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x)" ,__FUNCTION__,PLAYER_ERROR_INVALID_OPERATION);
 		return PLAYER_ERROR_INVALID_OPERATION;
@@ -525,18 +958,46 @@ int player_destroy (player_h player)
 		handle->state = PLAYER_STATE_NONE;
 		free(handle);
 		handle= NULL;
-		LOGE("[%s] End", __FUNCTION__);
+		LOGI("[%s] End", __FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-int 	player_prepare_async (player_h player, player_prepared_cb callback, void* user_data)
+static void *
+__prepare_async_thread_func(void *data)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	player_s *handle = data;
+	int ret = MM_ERROR_NONE;
+	LOGI("[%s]", __FUNCTION__);
+
+	ret = mm_player_pause(handle->mm_handle);
+	if(ret != MM_ERROR_NONE)
+	{
+		LOGE("[%s] Failed to pause - core fw error(0x%x)", __FUNCTION__, ret);
+		/*MM_MESSAGE_ERROR will not be posted as player_prepare(sync API) works with return value
+		of mm_player_pause So in case of async API we post the error message to application from here*/
+		MMMessageParamType msg_param;
+		msg_param.code = ret;
+		__msg_callback(MM_MESSAGE_ERROR, (void *)&msg_param, (void *)handle);
+
+		ret = mm_player_unrealize(handle->mm_handle);
+		if (ret != MM_ERROR_NONE)
+			LOGE("[%s] Failed to unrealize - 0x%x", __FUNCTION__,ret);
+	}
+	LOGI("[%s], done", __FUNCTION__);
+	return NULL;
+}
+
+int player_prepare_async (player_h player, player_prepared_cb callback, void* user_data)
+{
+	LOGI("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
-	handle->is_prepare_sync=0;
+
+	int ret;
+	bool visible;
+	bool value;
 
 	if(handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE])
 	{
@@ -545,12 +1006,11 @@ int 	player_prepare_async (player_h player, player_prepared_cb callback, void* u
 	}
 	else
 	{
-		LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_PREPARE);
+		//LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_PREPARE);
 		handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE] = callback;
 		handle->user_data[_PLAYER_EVENT_TYPE_PREPARE] = user_data;
 	}
 
-	int ret;
 	ret = mm_player_set_message_callback(handle->mm_handle, __msg_callback, (void*)handle);
 	if(ret != MM_ERROR_NONE)
 	{
@@ -567,40 +1027,61 @@ int 	player_prepare_async (player_h player, player_prepared_cb callback, void* u
 	}
 	else
 	{
-		mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 0, (char*)NULL);
+		ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_visible" ,&visible, (char*)NULL);
+		if(ret != MM_ERROR_NONE)
+		{
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
+		}
+		if(!visible)
+		{
+			value = FALSE;
+		}
+		else
+		{
+			value = TRUE;
+		}
+
+		ret = mm_player_set_attribute(handle->mm_handle, NULL, "display_visible", value, (char*)NULL);
+		if(ret != MM_ERROR_NONE)
+		{
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
+		}
 	}
 
-	ret = mm_player_set_attribute(handle->mm_handle, NULL, "profile_async_start", 1, (char*)NULL);
-	if(ret != MM_ERROR_NONE)
-	{
-		LOGE("[%s] Failed to set profile_async_start '1' (0x%x)" ,__FUNCTION__, ret);
-	}
 	ret = mm_player_realize(handle->mm_handle);
-	mm_player_set_mute(handle->mm_handle, 1);
-	mm_player_start(handle->mm_handle);
-	LOGE("START on Prepare() Async!!!!!!");
-
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		LOGE("[%s] Failed to realize - 0x%x", __FUNCTION__, ret);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
-	else
+
+	if (!handle->is_progressive_download)
 	{
-		LOGE("[%s] End", __FUNCTION__);
-		return PLAYER_ERROR_NONE;
+		ret = pthread_create(&handle->prepare_async_thread, NULL,
+			(void *)__prepare_async_thread_func, (void *)handle);
+
+		if (ret != 0)
+		{
+			LOGE("[%s] failed to create thread ret = %d", __FUNCTION__, ret);
+			return PLAYER_ERROR_OUT_OF_MEMORY;
+		}
 	}
+
+	LOGI("[%s] End", __FUNCTION__);
+	return PLAYER_ERROR_NONE;
 }
 
-int 	player_prepare (player_h player)
+int player_prepare (player_h player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	LOGI("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
-	MMTA_ACUM_ITEM_BEGIN("[CAPI] player_prepare", 0);
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
-	handle->is_prepare_sync=1;
 
 	int ret;
+	int visible;
+	int value;
+
 	ret = mm_player_set_message_callback(handle->mm_handle, __msg_callback, (void*)handle);
 	if(ret != MM_ERROR_NONE)
 	{
@@ -617,99 +1098,140 @@ int 	player_prepare (player_h player)
 	}
 	else
 	{
-		mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 0, (char*)NULL);
+		ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_visible" ,&visible, (char*)NULL);
+		if(ret != MM_ERROR_NONE)
+		{
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
+		}
+		if(!visible)
+		{
+			value = FALSE;
+		}
+		else
+		{
+			value = TRUE;
+		}
+
+		mm_player_set_attribute(handle->mm_handle, NULL, "display_visible", value, (char*)NULL);
+
+		if(ret != MM_ERROR_NONE)
+		{
+			LOGW("[%s] Failed to set display display_visible '0' (0x%x)" ,__FUNCTION__, ret);
+		}
 	}
 
-	ret = mm_player_set_attribute(handle->mm_handle, NULL, "profile_async_start", 0, (char*)NULL);
-	if(ret != MM_ERROR_NONE)
-	{
-		LOGE("[%s] Failed to set profile_async_start '0' (0x%x)" ,__FUNCTION__, ret);
-	}
-
-	int err;
-	mm_player_set_mute(handle->mm_handle, 1);
 	ret = mm_player_realize(handle->mm_handle);
-	err = mm_player_start(handle->mm_handle);
-	LOGE("START on Prepare() Sync!!!!!! : %d", err);
-	err = mm_player_pause(handle->mm_handle);
-	mm_player_set_mute(handle->mm_handle, 0);
-
-	MMTA_ACUM_ITEM_END("[CAPI] player_prepare", 0);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		LOGE("[%s] Failed to realize - 0x%x", __FUNCTION__,ret);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
+
+	if (!handle->is_progressive_download)
+		ret = mm_player_pause(handle->mm_handle);
+
+	if(ret != MM_ERROR_NONE)
+	{
+		int uret;
+		uret = mm_player_unrealize(handle->mm_handle);
+		if (uret != MM_ERROR_NONE)
+			LOGE("[%s] Failed to unrealize - 0x%x", __FUNCTION__,uret);
+
+		LOGE("[%s] Failed to pause - 0x%x", __FUNCTION__,ret);
+
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
 		handle->state = PLAYER_STATE_READY;
-		LOGE("[%s] End", __FUNCTION__);
+		LOGI("[%s] End", __FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-int 	player_unprepare (player_h player)
+int player_unprepare (player_h player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	LOGI("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
-	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
 		return PLAYER_ERROR_INVALID_STATE;
 	}
-	
+
+	__RELEASEIF_PREPARE_THREAD(handle->prepare_async_thread);
+
 	int ret = mm_player_unrealize(handle->mm_handle);
+
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
+		if (handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
+		{
+			handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+			handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+		}
+
+		if (handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE])
+		{
+			handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
+			handle->user_data[_PLAYER_EVENT_TYPE_PREPARE] = NULL;
+		}
+
 		handle->state = PLAYER_STATE_IDLE;
 		handle->display_type = MM_DISPLAY_SURFACE_NULL; // means DISPLAY_TYPE_NONE(3)
-		handle->second_display_type = MM_DISPLAY_SURFACE_NULL; // means DISPLAY_TYPE_NONE(3)
-		LOGE("[%s] End", __FUNCTION__);
+		handle->is_set_pixmap_cb = false;
+		handle->is_stopped=false;
+		handle->is_display_visible=true;
+		handle->is_progressive_download=false;
+		LOGI("[%s] End", __FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-int 	player_set_uri (player_h player, const char *uri)
+int player_set_uri (player_h player, const char *uri)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(uri);
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
-	
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,MM_PLAYER_CONTENT_URI , uri, strlen(uri), (char*)NULL);
+
+	int ret = mm_player_set_uri(handle->mm_handle, uri);
+
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
 }
 
-int 	player_set_memory_buffer (player_h player, const void *data, int size)
+int player_set_memory_buffer (player_h player, const void *data, int size)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(data);
 	PLAYER_CHECK_CONDITION(size>=0,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
-	
+
 	char uri[PATH_MAX] ;
-	
+
 	snprintf(uri, sizeof(uri),"mem:///ext=%s,size=%d","", size);
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,MM_PLAYER_CONTENT_URI, uri, strlen(uri), MM_PLAYER_MEMORY_SRC, data,size,(char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
 }
 
-int 	player_get_state (player_h player, player_state_e *state)
+int player_get_state (player_h player, player_state_e *state)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(state);
@@ -717,11 +1239,11 @@ int 	player_get_state (player_h player, player_state_e *state)
 	*state = handle->state;
 	MMPlayerStateType currentStat = MM_PLAYER_STATE_NULL;
 	mm_player_get_state(handle->mm_handle, &currentStat);
-	LOGE("[%s] State : %d (FW state : %d)", __FUNCTION__,handle->state, currentStat);
+	//LOGI("[%s] State : %d (FW state : %d)", __FUNCTION__,handle->state, currentStat);
 	return PLAYER_ERROR_NONE;
 }
 
-int 	player_set_volume (player_h player, float left, float right)
+int player_set_volume (player_h player, float left, float right)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_CHECK_CONDITION(left>=0 && left <= 1.0 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
@@ -733,7 +1255,7 @@ int 	player_set_volume (player_h player, float left, float right)
 	int ret = mm_player_set_volume(handle->mm_handle,&vol);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -741,7 +1263,7 @@ int 	player_set_volume (player_h player, float left, float right)
 	}
 }
 
-int 	player_get_volume (player_h player, float *left, float *right)
+int player_get_volume (player_h player, float *left, float *right)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(left);
@@ -751,7 +1273,7 @@ int 	player_get_volume (player_h player, float *left, float *right)
 	int ret = mm_player_get_volume(handle->mm_handle,&vol);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -766,43 +1288,84 @@ int player_set_sound_type(player_h player, sound_type_e type)
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
 
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"sound_volume_type" , type, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
 }
 
-int 	player_start (player_h player)
+int player_set_audio_latency_mode(player_h player, audio_latency_mode_e latency_mode)
 {
-	LOGE("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
-	MMTA_ACUM_ITEM_BEGIN("[CAPI] player_start only", 0);
-	MMTA_ACUM_ITEM_BEGIN("[CAPI] player_start ~ BOS", 0);
+	player_s * handle = (player_s *) player;
+
+	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"sound_latency_mode" , latency_mode, (char*)NULL);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_get_audio_latency_mode(player_h player, audio_latency_mode_e *latency_mode)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(latency_mode);
+	player_s * handle = (player_s *) player;
+
+	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"sound_latency_mode" , latency_mode, (char*)NULL);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_start (player_h player)
+{
+	LOGI("[%s] Start", __FUNCTION__);
+	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
 	int ret;
 	if ( handle->state  ==PLAYER_STATE_READY || handle->state ==PLAYER_STATE_PAUSED)
 	{
-		if(handle->display_type == PLAYER_DISPLAY_TYPE_X11 || handle->display_type == PLAYER_DISPLAY_TYPE_EVAS)
+		if(handle->display_type == PLAYER_DISPLAY_TYPE_OVERLAY
+			#ifdef TIZEN_MOBILE
+			|| handle->display_type == PLAYER_DISPLAY_TYPE_EVAS
+			#endif
+			)
 		{
-			ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 1, (char*)NULL);
-			LOGE("[%s] show video display : %d",__FUNCTION__, ret);
+			if(handle->is_display_visible)
+			{
+				ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 1, (char*)NULL);
+			}
 		}
-		if(handle->is_prepare_sync)
-		{
-			//TODO: fix it !
-			ret = mm_player_pause(handle->mm_handle);
-		}
+
 		if(handle->is_stopped)
 		{
+			if (handle->is_progressive_download)
+			{
+				LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x)" ,__FUNCTION__,PLAYER_ERROR_INVALID_OPERATION);
+				return PLAYER_ERROR_INVALID_OPERATION;
+			}
+
 			ret = mm_player_start(handle->mm_handle);
-			handle->is_stopped = FALSE;
-			LOGE("[%s] stop -> start() ",__FUNCTION__);
+			LOGI("[%s] stop -> start() ",__FUNCTION__);
 		}
 		else
-			ret = mm_player_resume(handle->mm_handle);
+		{
+			if (handle->is_progressive_download && handle->state  ==PLAYER_STATE_READY)
+				ret = mm_player_start(handle->mm_handle);
+			else
+				ret = mm_player_resume(handle->mm_handle);
+		}
 	}
 	else
 	{
@@ -812,33 +1375,49 @@ int 	player_start (player_h player)
 
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
+		handle->is_stopped = FALSE;
 		handle->state = PLAYER_STATE_PLAYING;
-		LOGE("[%s] End", __FUNCTION__);
+		LOGI("[%s] End", __FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-int 	player_stop (player_h player)
+int player_stop (player_h player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	LOGI("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
 	if (handle->state == PLAYER_STATE_PLAYING || handle->state == PLAYER_STATE_PAUSED)
 	{
 		int ret = mm_player_stop(handle->mm_handle);
+		if(handle->display_type == PLAYER_DISPLAY_TYPE_OVERLAY
+			#ifdef TIZEN_MOBILE
+			|| handle->display_type == PLAYER_DISPLAY_TYPE_EVAS
+			#endif
+		)
+		{
+			ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , 0, (char*)NULL);
+		}
+
 		if(ret != MM_ERROR_NONE)
 		{
-			return __convert_error_code(ret,(char*)__FUNCTION__);
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
 		}
 		else
 		{
+			if (handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
+			{
+				handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+				handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+			}
+
 			handle->state = PLAYER_STATE_READY;
 			handle->is_stopped = TRUE;
-			LOGE("[%s] End", __FUNCTION__);
+			LOGI("[%s] End", __FUNCTION__);
 			return PLAYER_ERROR_NONE;
 		}
 	}
@@ -849,32 +1428,37 @@ int 	player_stop (player_h player)
 	}
 }
 
-int 	player_pause (player_h player)
+int player_pause (player_h player)
 {
-	LOGE("[%s] Start", __FUNCTION__);
+	LOGI("[%s] Start", __FUNCTION__);
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_PLAYING);
-	
+
 	int ret = mm_player_pause(handle->mm_handle);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
 		handle->state = PLAYER_STATE_PAUSED;
-		LOGE("[%s] End", __FUNCTION__);
+		LOGI("[%s] End", __FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
 }
 
-int 	player_set_position (player_h player, int millisecond, player_seek_completed_cb callback, void *user_data)
+int player_set_play_position (player_h player, int millisecond, bool accurate, player_seek_completed_cb callback, void *user_data)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_CHECK_CONDITION(millisecond>=0  ,PLAYER_ERROR_INVALID_PARAMETER ,"PLAYER_ERROR_INVALID_PARAMETER" );
-
 	player_s * handle = (player_s *) player;
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
 	if(handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
 	{
 		LOGE("[%s] PLAYER_ERROR_SEEK_FAILED (0x%08x) : seeking... we can't do any more " ,__FUNCTION__, PLAYER_ERROR_SEEK_FAILED);
@@ -882,15 +1466,22 @@ int 	player_set_position (player_h player, int millisecond, player_seek_complete
 	}
 	else
 	{
-		LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_SEEK);
+		LOGI("[%s] Event type : %d, pos : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_SEEK, millisecond);
 		handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = callback;
 		handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = user_data;
 	}
-
-	int ret = mm_player_set_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_TIME, millisecond);
+	int accurated = accurate?1:0;
+	int ret = mm_player_set_attribute(handle->mm_handle, NULL, "accurate_seek", accurated, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
+	ret = mm_player_set_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_TIME, millisecond);
+	if(ret != MM_ERROR_NONE)
+	{
+		handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+		handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = NULL;
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -898,37 +1489,7 @@ int 	player_set_position (player_h player, int millisecond, player_seek_complete
 	}
 }
 
-int 	player_set_position_ratio (player_h player, int percent, player_seek_completed_cb callback, void *user_data)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_CHECK_CONDITION(percent>=0 && percent <= 100 ,PLAYER_ERROR_INVALID_PARAMETER ,"PLAYER_ERROR_INVALID_PARAMETER" );
-
-	player_s * handle = (player_s *) player;
-	if(handle->user_cb[_PLAYER_EVENT_TYPE_SEEK])
-	{
-		LOGE("[%s] PLAYER_ERROR_SEEK_FAILED (0x%08x) : seeking... we can't do any more " ,__FUNCTION__, PLAYER_ERROR_SEEK_FAILED);
-		return PLAYER_ERROR_SEEK_FAILED;
-	}
-	else
-	{
-		LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_SEEK);
-		handle->user_cb[_PLAYER_EVENT_TYPE_SEEK] = callback;
-		handle->user_data[_PLAYER_EVENT_TYPE_SEEK] = user_data;
-	}
-
-	int ret = mm_player_set_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_PERCENT , percent);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-	{
-		return PLAYER_ERROR_NONE;
-	}
-}
-
-
-int 	player_get_position (player_h player, int *millisecond)
+int player_get_play_position (player_h player, int *millisecond)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(millisecond);
@@ -942,7 +1503,7 @@ int 	player_get_position (player_h player, int *millisecond)
 	int ret = mm_player_get_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_TIME , &pos);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -951,30 +1512,7 @@ int 	player_get_position (player_h player, int *millisecond)
 	}
 }
 
-int 	player_get_position_ratio (player_h player,int *percent)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(percent);
-	player_s * handle = (player_s *) player;
-	if (!__player_state_validate(handle, PLAYER_STATE_READY))
-	{
-		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
-		return PLAYER_ERROR_INVALID_STATE;
-	}
-	int pos;
-	int ret = mm_player_get_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_PERCENT, &pos);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-	{
-		*percent=pos;
-		return PLAYER_ERROR_NONE;
-	}
-}
-
-int 	player_set_mute (player_h player, bool muted)
+int player_set_mute (player_h player, bool muted)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
@@ -982,7 +1520,7 @@ int 	player_set_mute (player_h player, bool muted)
 	int ret = mm_player_set_mute(handle->mm_handle, muted);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -990,7 +1528,7 @@ int 	player_set_mute (player_h player, bool muted)
 	}
 }
 
-int 	player_is_muted (player_h player, bool *muted)
+int player_is_muted (player_h player, bool *muted)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(muted);
@@ -1000,7 +1538,7 @@ int 	player_is_muted (player_h player, bool *muted)
 	int ret = mm_player_get_mute(handle->mm_handle, &_mute);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1011,7 +1549,7 @@ int 	player_is_muted (player_h player, bool *muted)
 		else
 		{
 			*muted = FALSE;
-		}	
+		}
 		return PLAYER_ERROR_NONE;
 	}
 }
@@ -1032,10 +1570,10 @@ int 	player_set_looping (player_h player, bool looping)
 		value = -1;
 	}
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,MM_PLAYER_PLAYBACK_COUNT , value, (char*)NULL);
-	
+
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1043,7 +1581,7 @@ int 	player_set_looping (player_h player, bool looping)
 	}
 }
 
-int 	player_is_looping (player_h player, bool *looping)
+int player_is_looping (player_h player, bool *looping)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(looping);
@@ -1057,7 +1595,7 @@ int 	player_is_looping (player_h player, bool *looping)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_PLAYBACK_COUNT , &count, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1073,7 +1611,7 @@ int 	player_is_looping (player_h player, bool *looping)
 	}
 }
 
-int 	player_get_duration (player_h player, int *duration)
+int player_get_duration (player_h player, int *duration)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(duration);
@@ -1087,12 +1625,12 @@ int 	player_get_duration (player_h player, int *duration)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_CONTENT_DURATION, &_duration, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
 		*duration = _duration;
-		LOGE("[%s] duration : %d",__FUNCTION__,_duration);
+		//LOGI("[%s] duration : %d",__FUNCTION__,_duration);
 		return PLAYER_ERROR_NONE;
 	}
 }
@@ -1101,123 +1639,153 @@ int player_set_display(player_h player, player_display_type_e type, player_displ
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
+	Evas_Object *obj = NULL;
+	const char *object_type = NULL;
+	void *set_handle = NULL;
 
 	int ret;
-	// in case of multi surface
-	if(handle->second_display_type!=(int)MM_DISPLAY_SURFACE_NULL)
-	{
-		if (handle->state != PLAYER_STATE_PLAYING && handle->state != PLAYER_STATE_PAUSED)
-		{
-			LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
-			return PLAYER_ERROR_INVALID_STATE;
-		}
-		LOGE("[%s] Change Type : %d",__FUNCTION__, type);
-
-		ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_surface_type", type,(char*)NULL);
-		if(ret != MM_ERROR_NONE)
-		{
-			return __convert_error_code(ret,(char*)__FUNCTION__);
-		}
-
-		else  if(type!=handle->display_type)
-		{
-			//do swap
-			player_display_type_e temp_type = handle->display_type;
-			handle->display_type = handle->second_display_type;
-			handle->second_display_type = temp_type;
-			LOGE("[%s]change surface - main Type : %d, main display addr : %x , second Type : %d, seconds display addr : %x ",__FUNCTION__,handle->display_type, handle->display_handle,  handle->second_display_type, handle->second_display_handle );
-			return PLAYER_ERROR_NONE;
-		}
-		else
-		{
-			LOGE("[%s] Skip change display : same type");
-			return PLAYER_ERROR_NONE;
-		}
-	}
-
-	// normal case
 	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
 		return PLAYER_ERROR_INVALID_STATE;
 	}
 
-	if (type == handle->display_type) // same type
+	if (type != PLAYER_DISPLAY_TYPE_NONE && display == NULL)
 	{
-		handle->display_handle = display;
-		ret = mm_player_set_attribute(handle->mm_handle, NULL, "display_overlay" , type == PLAYER_DISPLAY_TYPE_X11 ? &handle->display_handle : display, sizeof(display), (char*)NULL);
-	} else	if(handle->display_type == (int)MM_DISPLAY_SURFACE_NULL) // first
-	{
-		handle->display_handle = display;
-		handle->display_type = type;
-		LOGE("[%s] video display has been set initailly - type :%d",__FUNCTION__,type);
-		LOGE("[%s] main Type : %d, main display addr : %x",__FUNCTION__,handle->display_type, handle->display_handle);
-		ret = mm_player_set_attribute(handle->mm_handle, NULL, "display_surface_use_multi",0,"display_surface_type", type, "display_overlay" , type == PLAYER_DISPLAY_TYPE_X11 ? &handle->display_handle : display, sizeof(display), (char*)NULL);
+		LOGE("display type[%d] is not NONE, but display handle is NULL", type);
+		return PLAYER_ERROR_INVALID_PARAMETER;
 	}
-	else //secondary
+
+	if (handle->is_set_pixmap_cb)
 	{
-		handle->second_display_handle = handle->display_handle;
-		handle->second_display_type = handle->display_type;
-		handle->display_handle = display;
-		handle->display_type = type;
-		LOGE("[%s] video display has been set again- type :%d",__FUNCTION__,type);
-		LOGE("[%s] main Type : %d, main display addr : %x , second Type : %d, seconds display addr : %x ",__FUNCTION__,handle->display_type, handle->display_handle,  handle->second_display_type, handle->second_display_handle);
-		ret = mm_player_set_attribute(handle->mm_handle, NULL, "display_surface_use_multi",1,"display_surface_type", type, "display_overlay" , type == PLAYER_DISPLAY_TYPE_X11 ? &handle->display_handle : display, sizeof(display), "display_overlay_ext",handle->second_display_type == PLAYER_DISPLAY_TYPE_X11 ? &handle->second_display_handle: handle->second_display_handle, sizeof(handle->second_display_handle) ,(char*)NULL);
+		if (handle->state < PLAYER_STATE_READY)
+		{
+			/* just set below and go to "changing surface case" */
+			handle->is_set_pixmap_cb = false;
+		}
+		else
+		{
+			LOGE("[%s] pixmap callback was set, try it again after calling player_unprepare()" ,__FUNCTION__,PLAYER_ERROR_INVALID_OPERATION);
+			LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x)" ,__FUNCTION__,PLAYER_ERROR_INVALID_OPERATION);
+			return PLAYER_ERROR_INVALID_OPERATION;
+		}
+	}
+
+	void* temp = NULL;
+	if (type == PLAYER_DISPLAY_TYPE_NONE)
+	{
+		/* NULL surface */
+		handle->display_handle = 0;
+		handle->display_type = (int)MM_DISPLAY_SURFACE_NULL;
+		set_handle = NULL;
+	}
+	else
+	{
+		/* get handle from overlay or evas surface */
+		obj = (Evas_Object *)display;
+		object_type = evas_object_type_get(obj);
+		if (object_type)
+		{
+			temp = handle->display_handle;
+			if (type == PLAYER_DISPLAY_TYPE_OVERLAY && !strcmp(object_type, "elm_win"))
+			{
+				/* x window overlay surface */
+				LOGI("overlay surface type");
+				handle->display_handle = (void *)elm_win_xwindow_get(obj);
+				set_handle = &(handle->display_handle);
+			}
+			#ifdef TIZEN_MOBILE
+			else if (type == PLAYER_DISPLAY_TYPE_EVAS && !strcmp(object_type, "image"))
+			{
+				/* evas object surface */
+				LOGI("evas surface type");
+				handle->display_handle = display;
+				set_handle = display;
+			}
+			#endif
+			else
+			{
+				LOGE("invalid surface type");
+				return PLAYER_ERROR_INVALID_PARAMETER;
+			}
+		}
+		else
+		{
+			LOGE("falied to get evas object type from %p", obj);
+			return PLAYER_ERROR_INVALID_PARAMETER;
+		}
+	}
+
+	/* set display handle */
+	if (handle->display_type == (int)MM_DISPLAY_SURFACE_NULL || type == handle->display_type) // first time or same type
+	{
+		ret = mm_player_set_attribute(handle->mm_handle, NULL,
+			"display_surface_type", type,
+			"display_overlay", set_handle,
+			sizeof(display), (char*)NULL);
+
+		if (ret != MM_ERROR_NONE)
+		{
+			handle->display_handle = temp;
+			LOGE("[%s] Failed to display surface change :%d",__FUNCTION__,ret);
+		}
+		else
+		{
+			if (type != PLAYER_DISPLAY_TYPE_NONE)
+			{
+				handle->display_type = type;
+				LOGI("[%s] video display has been changed- type :%d, addr : 0x%x",
+					__FUNCTION__,handle->display_type, handle->display_handle);
+			}
+			else
+				LOGI("NULL surface");
+		}
+	}
+	else //changing surface case
+	{
+		ret = mm_player_change_videosink(handle->mm_handle, type, set_handle);
+		if (ret != MM_ERROR_NONE)
+		{
+			handle->display_handle = temp;
+			if(ret == MM_ERROR_NOT_SUPPORT_API)
+			{
+				LOGE("[%s] change video sink is not available.",__FUNCTION__);
+				ret = PLAYER_ERROR_NONE;
+			}
+			else
+			{
+				LOGE("[%s] Failed to display surface change :%d",__FUNCTION__,ret);
+			}
+		}
+		else
+		{
+			handle->display_type = type;
+			LOGI("[%s] video display has been changed- type :%d, addr : 0x%x",
+				__FUNCTION__,handle->display_type, handle->display_handle);
+		}
 	}
 
 	if(ret != MM_ERROR_NONE)
 	{
 		handle->display_type = MM_DISPLAY_SURFACE_NULL;
-		handle->second_display_type = MM_DISPLAY_SURFACE_NULL;
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
-		LOGE("[%s] End",__FUNCTION__);
 		return PLAYER_ERROR_NONE;
 	}
-}
-
-int player_is_display_mode_changeable(player_h player, bool* changeable)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(changeable);
-	player_s * handle = (player_s *) player;
-	switch(handle->display_type)
-	{
-		case PLAYER_DISPLAY_TYPE_X11:
-			*changeable = TRUE;
-			break;
-		case PLAYER_DISPLAY_TYPE_EVAS:
-		{
-			char *sink_name = NULL;
-			int length;
-			int scaling;
-			int ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_evas_surface_sink" ,&sink_name, &length, "display_evas_do_scaling", &scaling, (char*)NULL);
-			if(ret != MM_ERROR_NONE)
-				*changeable = FALSE;
-			if (!strncmp(sink_name,"evaspixmapsink",length) && scaling==1)
-			{
-				*changeable = TRUE;
-			}
-			break;
-		}
-		default:
-			*changeable = FALSE;
-			break;
-	}
-	return PLAYER_ERROR_NONE;
 }
 
 int player_set_display_mode(player_h player, player_display_mode_e mode)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
-	
+	LOGI("[%s] mode:%d", __FUNCTION__, mode);
+
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_method" , mode, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
@@ -1231,7 +1799,7 @@ int player_get_display_mode(player_h player, player_display_mode_e *mode)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_method"  ,mode, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1241,32 +1809,38 @@ int player_get_display_mode(player_h player, player_display_mode_e *mode)
 
 int player_set_playback_rate(player_h player, float rate)
 {
+	LOGI("[%s] rate : %0.1f", __FUNCTION__, rate);
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_CHECK_CONDITION(rate>=-5.0 && rate <= 5.0 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
 	player_s * handle = (player_s *) player;
-	PLAYER_STATE_CHECK(handle,PLAYER_STATE_PLAYING);
+
+	if (!__player_state_validate(handle, PLAYER_STATE_READY))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
 
 	int ret = mm_player_set_play_speed(handle->mm_handle, rate);
 
 	switch (ret)
 	{
-	case MM_ERROR_NONE:
-	case MM_ERROR_PLAYER_NO_OP:
-		ret = PLAYER_ERROR_NONE;
-		break;
-	case MM_ERROR_NOT_SUPPORT_API:
-	case MM_ERROR_PLAYER_SEEK:		
-		LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x) : seek error",__FUNCTION__, PLAYER_ERROR_INVALID_OPERATION);
-		ret = PLAYER_ERROR_INVALID_OPERATION;
-		break;
-	default:
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		case MM_ERROR_NONE:
+		case MM_ERROR_PLAYER_NO_OP:
+			ret = PLAYER_ERROR_NONE;
+			break;
+		case MM_ERROR_NOT_SUPPORT_API:
+		case MM_ERROR_PLAYER_SEEK:
+			LOGE("[%s] PLAYER_ERROR_INVALID_OPERATION(0x%08x) : seek error",__FUNCTION__, PLAYER_ERROR_INVALID_OPERATION);
+			ret = PLAYER_ERROR_INVALID_OPERATION;
+			break;
+		default:
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	return ret;
 }
 
 
-int player_set_x11_display_rotation(player_h player, player_display_rotation_e rotation)
+int player_set_display_rotation(player_h player, player_display_rotation_e rotation)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
@@ -1274,13 +1848,13 @@ int player_set_x11_display_rotation(player_h player, player_display_rotation_e r
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,MM_PLAYER_VIDEO_ROTATION , rotation, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
 }
 
-int player_get_x11_display_rotation( player_h player, player_display_rotation_e *rotation)
+int player_get_display_rotation( player_h player, player_display_rotation_e *rotation)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(rotation);
@@ -1288,7 +1862,7 @@ int player_get_x11_display_rotation( player_h player, player_display_rotation_e 
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_VIDEO_ROTATION ,rotation, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1296,7 +1870,7 @@ int player_get_x11_display_rotation( player_h player, player_display_rotation_e 
 	}
 }
 
-int player_set_x11_display_visible(player_h player, bool visible)
+int player_set_display_visible(player_h player, bool visible)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
@@ -1310,13 +1884,16 @@ int player_set_x11_display_visible(player_h player, bool visible)
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_visible" , value, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
+	{
+		handle->is_display_visible = visible;
 		return PLAYER_ERROR_NONE;
+	}
 }
 
-int player_is_x11_display_visible(player_h player, bool* visible)
+int player_is_display_visible(player_h player, bool* visible)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(visible);
@@ -1325,7 +1902,7 @@ int player_is_x11_display_visible(player_h player, bool* visible)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_visible" ,&count, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1337,58 +1914,9 @@ int player_is_x11_display_visible(player_h player, bool* visible)
 		{
 			*visible = TRUE;
 		}
-		
+
 		return PLAYER_ERROR_NONE;
 	}
-}
-
-int player_set_x11_display_zoom(player_h player, int level)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_CHECK_CONDITION(level>0 && level < 10 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
-
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_zoom" , level, (char*)NULL);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_get_x11_display_zoom( player_h player, int *level)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(level);
-	player_s * handle = (player_s *) player;
-	int _level;
-	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"display_zoom" , &_level, (char*)NULL);
-	if(ret != MM_ERROR_NONE)
-	{
-		*level=-1;
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-	{
-		*level = _level;
-		return PLAYER_ERROR_NONE;
-	}
-}
-
-int player_enable_evas_display_scaling(player_h player, bool enable)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-
-	int scaling = enable?1:0;
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"display_evas_do_scaling" , scaling, (char*)NULL);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-		return PLAYER_ERROR_NONE;
 }
 
 int player_get_content_info(player_h player, player_content_info_e key, char ** value)
@@ -1433,7 +1961,7 @@ int player_get_content_info(player_h player, player_content_info_e key, char ** 
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,attr ,&val, &val_len, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1472,7 +2000,7 @@ int player_get_codec_info(player_h player, char **audio_codec, char **video_code
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_AUDIO_CODEC,&audio,&audio_len,MM_PLAYER_VIDEO_CODEC,&video,&video_len,(char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1507,7 +2035,7 @@ int player_get_audio_stream_info(player_h player, int *sample_rate, int *channel
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_AUDIO_SAMPLERATE,sample_rate,MM_PLAYER_AUDIO_CHANNEL,channel,MM_PLAYER_AUDIO_BITRATE,bit_rate,(char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	return PLAYER_ERROR_NONE;
 }
@@ -1526,7 +2054,7 @@ int player_get_video_stream_info(player_h player, int *fps, int *bit_rate)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"content_video_fps",fps,"content_video_bitrate",bit_rate,(char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	return PLAYER_ERROR_NONE;
 }
@@ -1547,13 +2075,13 @@ int player_get_video_size (player_h player, int *width, int *height)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,MM_PLAYER_VIDEO_WIDTH ,&w,  MM_PLAYER_VIDEO_HEIGHT, &h, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
 		*width = w;
 		*height = h;
-		LOGE("[%s] width : %d, height : %d",__FUNCTION__,w, h);
+		LOGI("[%s] width : %d, height : %d",__FUNCTION__,w, h);
 		return PLAYER_ERROR_NONE;
 	}
 }
@@ -1572,153 +2100,9 @@ int player_get_album_art(player_h player, void **album_art, int *size)
 	int ret = mm_player_get_attribute(handle->mm_handle, NULL,"tag_album_cover",album_art,size,(char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	return PLAYER_ERROR_NONE;
-}
-
-int player_get_track_count(player_h player, player_track_type_e type, int *count)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(count);
-	player_s * handle = (player_s *) player;
-	if (!__player_state_validate(handle, PLAYER_STATE_READY))
-	{
-		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
-		return PLAYER_ERROR_INVALID_STATE;
-	}
-	int ret = mm_player_get_track_count(handle->mm_handle, type, count);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_set_value(player_h player, audio_effect_e effect, int value)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_set_level(handle->mm_handle,effect,0,value);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-	{
-		ret = mm_player_sound_filter_custom_apply(handle->mm_handle);
-		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__convert_error_code(ret,(char*)__FUNCTION__);
-	}
-}
-
-int player_audio_effect_get_value(player_h player, audio_effect_e effect, int *value)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(value);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_get_level(handle->mm_handle,effect,0,value);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_clear(player_h player, audio_effect_e effect)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_clear_ext_all(handle->mm_handle);
-	if(ret != MM_ERROR_NONE)
-	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	}
-	else
-	{
-		ret = mm_player_sound_filter_custom_apply(handle->mm_handle);
-		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__convert_error_code(ret,(char*)__FUNCTION__);
-	}
-}
-
-int player_audio_effect_get_value_range(player_h player, audio_effect_e effect, int* min, int* max)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(min);
-	PLAYER_NULL_ARG_CHECK(max);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_get_level_range(handle->mm_handle, effect, min, max);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_is_available(player_h player, audio_effect_e effect, bool *available)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(available);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_is_supported_custom_filter_type(handle->mm_handle, effect);
-	if(ret != MM_ERROR_NONE)
-		*available = FALSE;
-	else
-		*available = TRUE;
-	return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_foreach_supported_effect(player_h player, player_audio_effect_supported_effect_cb callback, void *user_data)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(callback);
-	player_s * handle = (player_s *) player;
-
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE);
-	handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE] = callback;
-	handle->user_data[_PLAYER_SUPPORTED_AUDIO_EFFECT_TYPE] = user_data;
-	int ret = mm_player_get_foreach_present_supported_filter_type(handle->mm_handle, MM_AUDIO_FILTER_TYPE_CUSTOM, __supported_audio_effect_type, (void*)handle);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_set_preset(player_h player, audio_effect_preset_e preset)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_preset_apply(handle->mm_handle, preset);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_preset_is_available(player_h player, audio_effect_preset_e preset, bool *available)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(available);
-	player_s * handle = (player_s *) player;
-	int ret = mm_player_is_supported_preset_filter_type(handle->mm_handle, preset);
-	if(ret != MM_ERROR_NONE)
-		*available = FALSE;
-	else
-		*available = TRUE;
-	return PLAYER_ERROR_NONE;
-}
-
-int player_audio_effect_foreach_supported_preset(player_h player, player_audio_effect_supported_preset_cb callback, void *user_data)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(callback);
-	player_s * handle = (player_s *) player;
-
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET);
-	handle->user_cb[_PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET] = callback;
-	handle->user_data[_PLAYER_SUPPORTED_AUDIO_EFFECT_PRESET] = user_data;
-	int ret = mm_player_get_foreach_present_supported_filter_type(handle->mm_handle, MM_AUDIO_FILTER_TYPE_PRESET, __supported_audio_effect_preset, (void*)handle);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
 }
 
 int player_audio_effect_get_equalizer_bands_count (player_h player, int *count)
@@ -1726,9 +2110,15 @@ int player_audio_effect_get_equalizer_bands_count (player_h player, int *count)
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(count);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_get_eq_bands_number(handle->mm_handle, count);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_get_eq_bands_number(handle->mm_handle, count);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	else
 		return PLAYER_ERROR_NONE;
 }
@@ -1738,26 +2128,43 @@ int player_audio_effect_set_equalizer_all_bands(player_h player, int *band_level
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(band_levels);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_set_level_eq_from_list(handle->mm_handle, band_levels, length);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_set_level_eq_from_list(handle->mm_handle, band_levels, length);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+	{
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
 	else
-		return PLAYER_ERROR_NONE;
+	{
+		ret = mm_player_audio_effect_custom_apply(handle->mm_handle);
+		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
 }
 
 int player_audio_effect_set_equalizer_band_level(player_h player, int index, int level)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_set_level(handle->mm_handle,MM_AUDIO_FILTER_CUSTOM_EQ, index, level);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_set_level(handle->mm_handle,MM_AUDIO_EFFECT_CUSTOM_EQ, index, level);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
-		ret = mm_player_sound_filter_custom_apply(handle->mm_handle);
-		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__convert_error_code(ret,(char*)__FUNCTION__);
+		ret = mm_player_audio_effect_custom_apply(handle->mm_handle);
+		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 }
 
@@ -1766,9 +2173,15 @@ int player_audio_effect_get_equalizer_band_level(player_h player, int index, int
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(level);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_get_level(handle->mm_handle,MM_AUDIO_FILTER_CUSTOM_EQ, index, level);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_get_level(handle->mm_handle,MM_AUDIO_EFFECT_CUSTOM_EQ, index, level);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	else
 		return PLAYER_ERROR_NONE;
 }
@@ -1779,9 +2192,51 @@ int player_audio_effect_get_equalizer_level_range(player_h player, int* min, int
 	PLAYER_NULL_ARG_CHECK(min);
 	PLAYER_NULL_ARG_CHECK(max);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_get_level_range(handle->mm_handle, MM_AUDIO_FILTER_CUSTOM_EQ, min, max);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_get_level_range(handle->mm_handle, MM_AUDIO_EFFECT_CUSTOM_EQ, min, max);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_audio_effect_get_equalizer_band_frequency(player_h player, int index, int *frequency)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(frequency);
+	player_s * handle = (player_s *) player;
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_get_eq_bands_freq(handle->mm_handle, index, frequency);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_audio_effect_get_equalizer_band_frequency_range(player_h player, int index, int *range)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(range);
+	player_s * handle = (player_s *) player;
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_get_eq_bands_width(handle->mm_handle, index, range);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	else
 		return PLAYER_ERROR_NONE;
 }
@@ -1790,11 +2245,22 @@ int player_audio_effect_equalizer_clear(player_h player)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_sound_filter_custom_clear_eq_all(handle->mm_handle);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_audio_effect_custom_clear_eq_all(handle->mm_handle);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+	{
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
 	else
-		return PLAYER_ERROR_NONE;
+	{
+		ret = mm_player_audio_effect_custom_apply(handle->mm_handle);
+		return (ret==MM_ERROR_NONE)?PLAYER_ERROR_NONE:__player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
 }
 
 int player_audio_effect_equalizer_is_available(player_h player, bool *available)
@@ -1802,7 +2268,13 @@ int player_audio_effect_equalizer_is_available(player_h player, bool *available)
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(available);
 	player_s * handle = (player_s *) player;
-	int ret = mm_player_is_supported_custom_filter_type(handle->mm_handle, MM_AUDIO_FILTER_CUSTOM_EQ);
+	if (!__player_state_validate(handle, PLAYER_STATE_IDLE))
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE (0x%08x) :  current state - %d" ,__FUNCTION__, PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	int ret = mm_player_is_supported_custom_effect_type(handle->mm_handle, MM_AUDIO_EFFECT_CUSTOM_EQ);
 	if(ret != MM_ERROR_NONE)
 		*available = FALSE;
 	else
@@ -1813,23 +2285,26 @@ int player_audio_effect_equalizer_is_available(player_h player, bool *available)
 int player_set_subtitle_path(player_h player,const char* path)
 {
 	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(path);
 	player_s * handle = (player_s *) player;
-	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
 
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"subtitle_uri" , path, strlen(path),"subtitle_silent", 0, (char*)NULL);
+	if ((path == NULL) && (handle->state != PLAYER_STATE_IDLE))
+	{
+		return PLAYER_ERROR_INVALID_PARAMETER;
+	}
+
+	int ret = mm_player_set_external_subtitle_path(handle->mm_handle, path);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
 }
 
-int player_set_subtitle_position(player_h player, int millisecond)
+int player_set_subtitle_position_offset(player_h player, int millisecond)
 {
 	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_CHECK_CONDITION(millisecond>=0  ,PLAYER_ERROR_INVALID_PARAMETER ,"PLAYER_ERROR_INVALID_PARAMETER" );
+//PLAYER_CHECK_CONDITION(millisecond>=0  ,PLAYER_ERROR_INVALID_PARAMETER ,"PLAYER_ERROR_INVALID_PARAMETER" );
 	player_s * handle = (player_s *) player;
 	if (!__player_state_validate(handle, PLAYER_STATE_PLAYING))
 	{
@@ -1840,7 +2315,7 @@ int player_set_subtitle_position(player_h player, int millisecond)
 	int ret = mm_player_adjust_subtitle_position(handle->mm_handle, MM_PLAYER_POS_FORMAT_TIME, millisecond);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
@@ -1850,24 +2325,30 @@ int player_set_progressive_download_path(player_h player, const char *path)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(path);
+	if (!_player_network_availability_check())
+		return PLAYER_ERROR_FEATURE_NOT_SUPPORTED_ON_DEVICE;
+
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
 
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"pd_mode", MM_PLAYER_PD_MODE_URI, "pd_location", path, strlen(path), (char*)NULL);
+	int ret = mm_player_set_attribute(handle->mm_handle, NULL, "pd_mode", MM_PLAYER_PD_MODE_URI, "pd_location", path, strlen(path), (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
+	{
+		handle->is_progressive_download = 1;
 		return PLAYER_ERROR_NONE;
+	}
 }
 
 int player_get_progressive_download_status(player_h player, unsigned long *current, unsigned long *total_size)
 {
-
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(current);
 	PLAYER_NULL_ARG_CHECK(total_size);
+
 	player_s * handle = (player_s *) player;
 	if (handle->state != PLAYER_STATE_PLAYING && handle->state != PLAYER_STATE_PAUSED)
 	{
@@ -1879,7 +2360,7 @@ int player_get_progressive_download_status(player_h player, unsigned long *curre
 	int ret = mm_player_get_pd_status(handle->mm_handle, &_current, &_total);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1907,7 +2388,7 @@ int player_capture_video(player_h player, player_video_captured_cb callback, voi
 		handle->user_data[_PLAYER_EVENT_TYPE_CAPTURE] = user_data;
 	}
 
-	if(handle->state == PLAYER_STATE_PAUSED || handle->state == PLAYER_STATE_PLAYING )
+	if(handle->state >= PLAYER_STATE_READY)
 	{
 		int ret = mm_player_do_video_capture(handle->mm_handle);
 		if(ret==MM_ERROR_PLAYER_NO_OP)
@@ -1921,7 +2402,7 @@ int player_capture_video(player_h player, player_video_captured_cb callback, voi
 		{
 			handle->user_cb[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
 			handle->user_data[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
-			return __convert_error_code(ret,(char*)__FUNCTION__);
+			return __player_convert_error_code(ret,(char*)__FUNCTION__);
 		}
 		else
 			return PLAYER_ERROR_NONE;
@@ -1932,7 +2413,7 @@ int player_capture_video(player_h player, player_video_captured_cb callback, voi
 		handle->user_cb[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
 		handle->user_data[_PLAYER_EVENT_TYPE_CAPTURE] = NULL;
 		return PLAYER_ERROR_INVALID_STATE;
-	}	
+	}
 }
 
 int player_set_streaming_cookie(player_h player, const char *cookie, int size)
@@ -1942,11 +2423,28 @@ int player_set_streaming_cookie(player_h player, const char *cookie, int size)
 	PLAYER_CHECK_CONDITION(size>=0,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
 	player_s * handle = (player_s *) player;
 	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
-	
+
 	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"streaming_cookie", cookie, size, (char*)NULL);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_set_streaming_user_agent(player_h player, const char *user_agent, int size)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(user_agent);
+	PLAYER_CHECK_CONDITION(size>=0,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
+	player_s * handle = (player_s *) player;
+	PLAYER_STATE_CHECK(handle,PLAYER_STATE_IDLE);
+
+	int ret = mm_player_set_attribute(handle->mm_handle, NULL,"streaming_user_agent", user_agent, size, (char*)NULL);
+	if(ret != MM_ERROR_NONE)
+	{
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 		return PLAYER_ERROR_NONE;
@@ -1957,18 +2455,19 @@ int player_get_streaming_download_progress(player_h player, int *start, int *cur
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(start);
 	PLAYER_NULL_ARG_CHECK(current);
+
 	player_s * handle = (player_s *) player;
 	if (handle->state != PLAYER_STATE_PLAYING && handle->state != PLAYER_STATE_PAUSED)
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
 		return PLAYER_ERROR_INVALID_STATE;
 	}
-	int _current;
-	int _start;
+	int _current=0;
+	int _start=0;
 	int ret = mm_player_get_buffer_position(handle->mm_handle,MM_PLAYER_POS_FORMAT_PERCENT,&_start,&_current);
 	if(ret != MM_ERROR_NONE)
 	{
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	}
 	else
 	{
@@ -1978,162 +2477,63 @@ int player_get_streaming_download_progress(player_h player, int *start, int *cur
 	}
 }
 
-int 	player_set_started_cb (player_h player, player_started_cb callback, void *user_data)
-{
-	return __set_callback(_PLAYER_EVENT_TYPE_BEGIN,player,callback,user_data);
-}
-
-int 	player_unset_started_cb (player_h player)
-{
-	return __unset_callback(_PLAYER_EVENT_TYPE_BEGIN,player);
-}
-
-int 	player_set_completed_cb (player_h player, player_completed_cb callback, void *user_data)
+int player_set_completed_cb (player_h player, player_completed_cb callback, void *user_data)
 {
 	return __set_callback(_PLAYER_EVENT_TYPE_COMPLETE,player,callback,user_data);
 }
 
-int 	player_unset_completed_cb (player_h player)
+int player_unset_completed_cb (player_h player)
 {
 	return __unset_callback(_PLAYER_EVENT_TYPE_COMPLETE,player);
 }
 
-int 	player_set_paused_cb (player_h player, player_paused_cb callback, void *user_data)
-{
-	return __set_callback(_PLAYER_EVENT_TYPE_PAUSE,player,callback,user_data);
-}
-
-int 	player_unset_paused_cb (player_h player)
-{
-	return __unset_callback(_PLAYER_EVENT_TYPE_PAUSE,player);
-}
-
-int 	player_set_interrupted_cb (player_h player, player_interrupted_cb callback, void *user_data)
+int player_set_interrupted_cb (player_h player, player_interrupted_cb callback, void *user_data)
 {
 	return __set_callback(_PLAYER_EVENT_TYPE_INTERRUPT,player,callback,user_data);
 }
 
-int 	player_unset_interrupted_cb (player_h player)
+int player_unset_interrupted_cb (player_h player)
 {
 	return __unset_callback(_PLAYER_EVENT_TYPE_INTERRUPT,player);
 }
 
-int 	player_set_error_cb (player_h player, player_error_cb callback, void *user_data)
+int player_set_error_cb (player_h player, player_error_cb callback, void *user_data)
 {
 	return __set_callback(_PLAYER_EVENT_TYPE_ERROR,player,callback,user_data);
 }
 
-int 	player_unset_error_cb (player_h player)
+int player_unset_error_cb (player_h player)
 {
 	return __unset_callback(_PLAYER_EVENT_TYPE_ERROR,player);
 }
 
-int 	player_set_buffering_cb (player_h player, player_buffering_cb callback, void *user_data)
+int player_set_buffering_cb (player_h player, player_buffering_cb callback, void *user_data)
 {
 	return __set_callback(_PLAYER_EVENT_TYPE_BUFFERING,player,callback,user_data);
 }
 
-int 	player_unset_buffering_cb (player_h player)
+int player_unset_buffering_cb (player_h player)
 {
 	return __unset_callback(_PLAYER_EVENT_TYPE_BUFFERING,player);
 }
 
-int 	player_set_subtitle_updated_cb(player_h player, player_subtitle_updated_cb callback, void* user_data )
+int player_set_subtitle_updated_cb(player_h player, player_subtitle_updated_cb callback, void* user_data )
 {
 	return __set_callback(_PLAYER_EVENT_TYPE_SUBTITLE,player,callback,user_data);
 }
 
-int 	player_unset_subtitle_updated_cb (player_h player)
+int player_unset_subtitle_updated_cb (player_h player)
 {
 	return __unset_callback(_PLAYER_EVENT_TYPE_SUBTITLE,player);
-}
-
-int player_set_video_frame_decoded_cb(player_h player, player_video_frame_decoded_cb callback, void *user_data)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(callback);
-	player_s * handle = (player_s *) player;
-	if (handle->state != PLAYER_STATE_IDLE  &&  handle->state != PLAYER_STATE_READY)
-	{
-		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
-		return PLAYER_ERROR_INVALID_STATE;
-	}
-	
-	int ret = mm_player_set_video_stream_callback(handle->mm_handle, __video_stream_callback, (void*)handle);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-
-	handle->user_cb[_PLAYER_EVENT_TYPE_VIDEO_FRAME] = callback;
-	handle->user_data[_PLAYER_EVENT_TYPE_VIDEO_FRAME] = user_data;
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_VIDEO_FRAME);
-	return PLAYER_ERROR_NONE;
-}
-
-int player_unset_video_frame_decoded_cb(player_h player)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-	handle->user_cb[_PLAYER_EVENT_TYPE_VIDEO_FRAME] = NULL;
-	handle->user_data[_PLAYER_EVENT_TYPE_VIDEO_FRAME] = NULL;
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_VIDEO_FRAME);
-	int ret = mm_player_set_video_stream_callback(handle->mm_handle, NULL, NULL);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
-}
-
-int player_set_audio_frame_decoded_cb(player_h player, int start, int end, player_audio_frame_decoded_cb callback, void *user_data)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	PLAYER_NULL_ARG_CHECK(callback);
-	PLAYER_CHECK_CONDITION(start>=0 ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
-	PLAYER_CHECK_CONDITION(end>=start ,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER" );
-	player_s * handle = (player_s *) player;
-	if (handle->state != PLAYER_STATE_IDLE  &&  handle->state != PLAYER_STATE_READY)
-	{
-		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
-		return PLAYER_ERROR_INVALID_STATE;
-	}
-
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL, "pcm_extraction",TRUE, "pcm_extraction_start_msec", start, "pcm_extraction_end_msec", end, NULL);	
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	
-	ret = mm_player_set_audio_stream_callback(handle->mm_handle, __audio_stream_callback, (void*)handle);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-
-	handle->user_cb[_PLAYER_EVENT_TYPE_AUDIO_FRAME] = callback;
-	handle->user_data[_PLAYER_EVENT_TYPE_AUDIO_FRAME] = user_data;
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_AUDIO_FRAME);
-	return PLAYER_ERROR_NONE;
-}
-
-int player_unset_audio_frame_decoded_cb(player_h player)
-{
-	PLAYER_INSTANCE_CHECK(player);
-	player_s * handle = (player_s *) player;
-
-	handle->user_cb[_PLAYER_EVENT_TYPE_AUDIO_FRAME] = NULL;
-	handle->user_data[_PLAYER_EVENT_TYPE_AUDIO_FRAME] = NULL;
-	LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_AUDIO_FRAME);
-
-	int ret = mm_player_set_attribute(handle->mm_handle, NULL, "pcm_extraction",FALSE, NULL);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	
-	ret = mm_player_set_audio_buffer_callback(handle->mm_handle, NULL, NULL);
-	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
-	else
-		return PLAYER_ERROR_NONE;
 }
 
 int player_set_progressive_download_message_cb(player_h player, player_pd_message_cb callback, void *user_data)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	PLAYER_NULL_ARG_CHECK(callback);
+	if (!_player_network_availability_check())
+		return PLAYER_ERROR_FEATURE_NOT_SUPPORTED_ON_DEVICE;
+
 	player_s * handle = (player_s *) player;
 	if (handle->state != PLAYER_STATE_IDLE  &&  handle->state != PLAYER_STATE_READY)
 	{
@@ -2143,7 +2543,7 @@ int player_set_progressive_download_message_cb(player_h player, player_pd_messag
 
 	int ret = mm_player_set_pd_message_callback(handle->mm_handle, __pd_message_callback, (void*)handle);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 
 	handle->user_cb[_PLAYER_EVENT_TYPE_PD] = callback;
 	handle->user_data[_PLAYER_EVENT_TYPE_PD] = user_data;
@@ -2162,7 +2562,54 @@ int player_unset_progressive_download_message_cb(player_h player)
 
 	int ret = mm_player_set_pd_message_callback(handle->mm_handle, NULL, NULL);
 	if(ret != MM_ERROR_NONE)
-		return __convert_error_code(ret,(char*)__FUNCTION__);
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	else
+		return PLAYER_ERROR_NONE;
+}
+
+int player_set_media_packet_video_frame_decoded_cb(player_h player, player_media_packet_video_decoded_cb callback, void *user_data)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	PLAYER_NULL_ARG_CHECK(callback);
+
+	player_s * handle = (player_s *) player;
+	if (handle->state != PLAYER_STATE_IDLE)
+	{
+		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+		return PLAYER_ERROR_INVALID_STATE;
+	}
+
+	mm_player_enable_media_packet_video_stream(handle->mm_handle, TRUE);
+
+	int ret = mm_player_set_video_stream_callback(handle->mm_handle, __video_stream_callback, (void*)handle);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+
+	handle->user_cb[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME] = callback;
+	handle->user_data[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME] = user_data;
+	LOGI("Event type : %d ", _PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME);
+
+	return PLAYER_ERROR_NONE;
+}
+
+int player_unset_media_packet_video_frame_decoded_cb(player_h player)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	player_s * handle = (player_s *) player;
+
+	if (handle->state > PLAYER_STATE_READY)
+	{
+                LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
+                return PLAYER_ERROR_INVALID_STATE;
+        }
+
+	handle->user_cb[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME] = NULL;
+	handle->user_data[_PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME] = NULL;
+	LOGI("Event type : %d ", _PLAYER_EVENT_TYPE_MEDIA_PACKET_VIDEO_FRAME);
+
+	int ret = mm_player_set_video_stream_callback(handle->mm_handle, NULL, NULL);
+	if(ret != MM_ERROR_NONE)
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
 	else
 		return PLAYER_ERROR_NONE;
 }

@@ -7,11 +7,21 @@ PROJECT(${fw_name})
 SET(CMAKE_INSTALL_PREFIX /usr)
 SET(PREFIX ${CMAKE_INSTALL_PREFIX})
 
-SET(INC_DIR include)
-INCLUDE_DIRECTORIES(${INC_DIR})
 
-SET(dependents "dlog mm-player capi-base-common capi-media-sound-manager mm-ta")
-SET(pc_dependents "capi-base-common capi-media-sound-manager")
+IF (TIZEN_WEARABLE)
+SET(INC_DIR include/wearable)
+ENDIF (TIZEN_WEARABLE)
+
+IF (TIZEN_MOBILE)
+SET(INC_DIR include/mobile)
+ENDIF (TIZEN_MOBILE)
+
+SET(INC_COM_DIR include)
+
+INCLUDE_DIRECTORIES(${INC_DIR}, ${INC_COM_DIR})
+
+SET(dependents "libtbm capi-media-tool dlog mm-player capi-base-common capi-media-sound-manager gstreamer-0.10 evas ecore elementary capi-system-info")
+SET(pc_dependents "libtbm capi-media-tool capi-base-common capi-media-sound-manager")
 
 INCLUDE(FindPkgConfig)
 pkg_check_modules(${fw_name} REQUIRED ${dependents})
@@ -19,7 +29,7 @@ FOREACH(flag ${${fw_name}_CFLAGS})
     SET(EXTRA_CFLAGS "${EXTRA_CFLAGS} ${flag}")
 ENDFOREACH(flag)
 
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -fPIC -Wall -Werror -DGST_EXT_TIME_ANALYSIS")
+SET(CMAKE_C_FLAGS "-I./${INC_DIR} -I./${INC_COM_DIR} ${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -fPIC -Wall -Werror -DGST_EXT_TIME_ANALYSIS -D_PLAYER_FOR_PRODUCT")
 SET(CMAKE_C_FLAGS_DEBUG "-O0 -g")
 
 IF("${ARCH}" STREQUAL "arm")
@@ -28,6 +38,10 @@ ENDIF("${ARCH}" STREQUAL "arm")
 
 ADD_DEFINITIONS("-DPREFIX=\"${CMAKE_INSTALL_PREFIX}\"")
 ADD_DEFINITIONS("-DTIZEN_DEBUG")
+
+IF (TIZEN_MOBILE)
+ADD_DEFINITIONS("-DTIZEN_MOBILE")
+ENDIF(TIZEN_MOBILE)
 
 SET(CMAKE_EXE_LINKER_FLAGS "-Wl,--as-needed -Wl,--rpath=/usr/lib")
 
@@ -63,7 +77,7 @@ CONFIGURE_FILE(
 )
 INSTALL(FILES ${CMAKE_CURRENT_SOURCE_DIR}/${fw_name}.pc DESTINATION lib/pkgconfig)
 
-#ADD_SUBDIRECTORY(test)
+ADD_SUBDIRECTORY(test)
 
 IF(UNIX)
 

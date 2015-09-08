@@ -1,7 +1,7 @@
 CMAKE_MINIMUM_REQUIRED(VERSION 2.6)
 SET(fw_test "${fw_name}-test")
 
-INCLUDE_DIRECTORIES(../include)
+INCLUDE_DIRECTORIES(../include/mobile)
 link_directories(${CMAKE_SOURCE_DIR}/../)
 
 INCLUDE(FindPkgConfig)
@@ -10,7 +10,7 @@ FOREACH(flag ${${fw_test}_CFLAGS})
     SET(EXTRA_CFLAGS "${EXTRA_CFLAGS} ${flag}")
 ENDFOREACH(flag)
 
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -Wall -Werror")
+SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -pie")
 
 aux_source_directory(. sources)
 FOREACH(src ${sources})
