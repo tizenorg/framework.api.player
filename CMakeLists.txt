@@ -7,7 +7,6 @@ PROJECT(${fw_name})
 SET(CMAKE_INSTALL_PREFIX /usr)
 SET(PREFIX ${CMAKE_INSTALL_PREFIX})
 
-
 IF (TIZEN_WEARABLE)
 SET(INC_DIR include/wearable)
 ENDIF (TIZEN_WEARABLE)
@@ -20,7 +19,7 @@ SET(INC_COM_DIR include)
 
 INCLUDE_DIRECTORIES(${INC_DIR}, ${INC_COM_DIR})
 
-SET(dependents "libtbm capi-media-tool dlog mm-player capi-base-common capi-media-sound-manager gstreamer-0.10 evas ecore elementary capi-system-info")
+SET(dependents "libtbm capi-media-tool dlog mm-player capi-base-common capi-media-sound-manager evas ecore elementary ttrace capi-system-info")
 SET(pc_dependents "libtbm capi-media-tool capi-base-common capi-media-sound-manager")
 
 INCLUDE(FindPkgConfig)
@@ -29,7 +28,7 @@ FOREACH(flag ${${fw_name}_CFLAGS})
     SET(EXTRA_CFLAGS "${EXTRA_CFLAGS} ${flag}")
 ENDFOREACH(flag)
 
-SET(CMAKE_C_FLAGS "-I./${INC_DIR} -I./${INC_COM_DIR} ${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -fPIC -Wall -Werror -DGST_EXT_TIME_ANALYSIS -D_PLAYER_FOR_PRODUCT")
+SET(CMAKE_C_FLAGS "-I./${INC_DIR} ${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -fPIC -Wall -Werror")
 SET(CMAKE_C_FLAGS_DEBUG "-O0 -g")
 
 IF("${ARCH}" STREQUAL "arm")
@@ -38,6 +37,9 @@ ENDIF("${ARCH}" STREQUAL "arm")
 
 ADD_DEFINITIONS("-DPREFIX=\"${CMAKE_INSTALL_PREFIX}\"")
 ADD_DEFINITIONS("-DTIZEN_DEBUG")
+IF(TIZEN_TTRACE)
+ADD_DEFINITIONS("-DTIZEN_TTRACE")
+ENDIF(TIZEN_TTRACE)
 
 IF (TIZEN_MOBILE)
 ADD_DEFINITIONS("-DTIZEN_MOBILE")
@@ -45,7 +47,9 @@ ENDIF(TIZEN_MOBILE)
 
 SET(CMAKE_EXE_LINKER_FLAGS "-Wl,--as-needed -Wl,--rpath=/usr/lib")
 
-aux_source_directory(src SOURCES)
+#aux_source_directory(src SOURCES)
+SET(SOURCES src/player.c src/player_internal.c)
+
 ADD_LIBRARY(${fw_name} SHARED ${SOURCES})
 
 TARGET_LINK_LIBRARIES(${fw_name} ${${fw_name}_LDFLAGS})
@@ -58,13 +62,13 @@ SET_TARGET_PROPERTIES(${fw_name}
 )
 
 INSTALL(TARGETS ${fw_name} DESTINATION lib)
+
 INSTALL(
         DIRECTORY ${INC_DIR}/ DESTINATION include/media
         FILES_MATCHING
         PATTERN "*_private.h" EXCLUDE
         PATTERN "${INC_DIR}/*.h"
         )
-
 SET(PC_NAME ${fw_name})
 SET(PC_REQUIRED ${pc_dependents})
 SET(PC_LDFLAGS -l${fw_name})
@@ -83,10 +87,10 @@ IF(UNIX)
 
 ADD_CUSTOM_TARGET (distclean @echo cleaning for source distribution)
 ADD_CUSTOM_COMMAND(
-        DEPENDS clean 
+        DEPENDS clean
         COMMENT "distribution clean"
         COMMAND find
-        ARGS    . 
+        ARGS    .
         -not -name config.cmake -and \(
         -name tester.c -or
         -name Testing -or

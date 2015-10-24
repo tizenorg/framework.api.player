@@ -5,12 +5,13 @@ INCLUDE_DIRECTORIES(../include/mobile)
 link_directories(${CMAKE_SOURCE_DIR}/../)
 
 INCLUDE(FindPkgConfig)
-pkg_check_modules(${fw_test} REQUIRED mm-player appcore-efl elementary ecore evas ecore-x capi-media-sound-manager)
+pkg_check_modules(${fw_test} REQUIRED mm-player appcore-efl elementary ecore evas ecore-x capi-media-sound-manager eom)
 FOREACH(flag ${${fw_test}_CFLAGS})
     SET(EXTRA_CFLAGS "${EXTRA_CFLAGS} ${flag}")
 ENDFOREACH(flag)
 
-SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${EXTRA_CFLAGS} -pie")
+SET(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${EXTRA_CFLAGS}")
+SET(CMAKE_EXE_LINKER_FLAGS "-pie -Wl,--as-needed -Wl,--rpath=/usr/lib/gstreamer-1.0")
 
 aux_source_directory(. sources)
 FOREACH(src ${sources})
@@ -18,5 +19,6 @@ FOREACH(src ${sources})
     MESSAGE("${src_name}")
     ADD_EXECUTABLE(${src_name} ${src})
     TARGET_LINK_LIBRARIES(${src_name} capi-media-player ${${fw_test}_LDFLAGS})
+    INSTALL(TARGETS ${src_name} DESTINATION bin)
 ENDFOREACH()
 

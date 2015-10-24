@@ -1,8 +1,42 @@
 <manifest>
+	<define>
+		<domain name="media-player"/>
+		<request>
+			<smack request="device::app_logging" type="rw"/>
+			<smack request="device::sys_logging" type="rw"/>
+			<smack request="device::hwcodec" type="rw"/>
+			<smack request="system::homedir" type="rwx"/>
+			<smack request="system::media" type="rwx"/>
+			<smack request="system::share" type="rwx"/>
+			<smack request="tizen::vconf::setting::admin" type="rl"/>
+			<smack request="tizen::vconf::public::r" type="rl"/>
+			<smack request="pkgmgr::db" type="rwl"/>
+			<smack request="sdbd" type="rwx"/>
+			<smack request="sdbd::home" type="rwx"/>
+			<smack request="xorg" type="rw"/>
+			<smack request="isf" type="rwx"/>
+			<smack request="sound_server" type="rw"/>
+			<smack request="pulseaudio" type="rwx"/>
+			<smack request="connman" type="rw"/>
+			<smack request="ca-certificates::ssl-certs" type="rwx"/>
+			<smack request="system::use_internet" type="rw"/>
+			<smack request="sys-assert::core" type="rwx"/>
+		</request>
+		<permit>
+			<smack permit="sound_server" type="rw"/>
+			<smack permit="xorg" type="rwx"/>
+			<smack permit="connman" type="rw"/>
+			<smack permit="system::use_internet" type="rw"/>
+			<smack permit="mtp-responder" type="r"/>
+		</permit>
+	</define>
 	<request>
 		<domain name="_" />
 	</request>
 	<assign>
-		<filesystem path="/usr/bin/player_test" label="_" exec_label="none" />
+		<filesystem path="/usr/bin/player_test" label="media-player" exec_label="media-player" />
+		<filesystem path="/usr/bin/player_es_push_test" label="media-player" exec_label="media-player" />
+		<filesystem path="/usr/bin/player_media_packet_test" label="media-player" exec_label="media-player" />
+		<filesystem path="/home/root/.cache/gstreamer-1.0/registry*" label="_" />
 	</assign>
 </manifest>

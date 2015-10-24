@@ -28,6 +28,7 @@ extern "C" {
 #undef LOG_TAG
 #endif
 #define LOG_TAG "TIZEN_N_PLAYER"
+//#define USE_ECORE_FUNCTIONS
 
 #define PLAYER_CHECK_CONDITION(condition,error,msg)     \
                 if(condition) {} else \
@@ -46,6 +47,18 @@ extern "C" {
         PLAYER_CHECK_CONDITION(arg <= max,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER")		\
         PLAYER_CHECK_CONDITION(arg >= min,PLAYER_ERROR_INVALID_PARAMETER,"PLAYER_ERROR_INVALID_PARAMETER")
 
+#ifdef TIZEN_TTRACE
+#include <ttrace.h>
+#define PLAYER_TRACE_BEGIN(NAME) traceBegin(TTRACE_TAG_VIDEO, NAME)
+#define PLAYER_TRACE_END() traceEnd(TTRACE_TAG_VIDEO)
+#define PLAYER_TRACE_ASYNC_BEGIN(NAME, COOKIE) traceAsyncBegin (TTRACE_TAG_VIDEO, COOKIE, NAME);
+#define PLAYER_TRACE_ASYNC_END(NAME, COOKIE) traceAsyncEnd(TTRACE_TAG_VIDEO, COOKIE, NAME);
+#else
+#define PLAYER_TRACE_BEGIN(NAME)
+#define PLAYER_TRACE_END()
+#define PLAYER_TRACE_ASYNC_BEGIN(NAME, KEY)
+#define PLAYER_TRACE_ASYNC_END(NAME, KEY)
+#endif
 
 typedef enum {
 	_PLAYER_EVENT_TYPE_PREPARE,
@@ -67,8 +80,26 @@ typedef enum {
 	_PLAYER_EVENT_TYPE_IMAGE_BUFFER,
 	_PLAYER_EVENT_TYPE_SELECTED_SUBTITLE_LANGUAGE,
 #endif
+	_PLAYER_EVENT_TYPE_MEDIA_STREAM_VIDEO_BUFFER_STATUS,
+	_PLAYER_EVENT_TYPE_MEDIA_STREAM_AUDIO_BUFFER_STATUS,
+	_PLAYER_EVENT_TYPE_MEDIA_STREAM_VIDEO_SEEK,
+	_PLAYER_EVENT_TYPE_MEDIA_STREAM_AUDIO_SEEK,
+	_PLAYER_EVENT_TYPE_AUDIO_STREAM_CHANGED,
+	_PLAYER_EVENT_TYPE_VIDEO_STREAM_CHANGED,
 	_PLAYER_EVENT_TYPE_NUM
 }_player_event_e;
+
+#ifndef USE_ECORE_FUNCTIONS
+typedef enum {
+	PLAYER_MESSAGE_NONE,
+	PLAYER_MESSAGE_PREPARED,
+	PLAYER_MESSAGE_ERROR,
+	PLAYER_MESSAGE_SEEK_DONE,
+	PLAYER_MESSAGE_EOS,
+	PLAYER_MESSAGE_LOOP_EXIT,
+	PLAYER_MESSAGE_MAX
+}_player_message_e;
+#endif
 
 typedef struct _player_s{
 	MMHandleType mm_handle;
@@ -82,7 +113,15 @@ typedef struct _player_s{
 	bool is_display_visible;
 	bool is_progressive_download;
 	pthread_t prepare_async_thread;
+#ifdef USE_ECORE_FUNCTIONS
 	GHashTable *ecore_jobs;
+#else
+	pthread_t message_thread;
+	GQueue *message_queue;
+	GMutex message_queue_lock;
+	GCond message_queue_cond;
+	int current_message;
+#endif
 	player_error_e error_code;
 	bool is_doing_jobs;
 	media_format_h pkt_fmt;

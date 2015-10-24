@@ -21,7 +21,6 @@
 #include <glib.h>
 #include <appcore-efl.h>
 
-#define KEY_END "XF86Stop"
 #define MEDIA_FILE_PATH "/opt/usr/media/Color.mp4"
 #ifdef PACKAGE
 #undef PACKAGE
@@ -72,7 +71,7 @@ keydown_cb(void *data , int type , void *event)
 
 	LOGD("start");
 
-	if (!strcmp(ev->keyname, KEY_END)) {
+	if (!strcmp(ev->keyname, "XF86Back")) {
 		/* Let window go to hide state. */
 		//elm_win_lower(ad->win);
 		LOGD("elm exit");
@@ -90,7 +89,7 @@ static void
 create_base_gui(appdata_s *ad)
 {
 	/* Enable GLES Backened */
-	elm_config_preferred_engine_set("opengl_x11");
+	elm_config_preferred_engine_set("3d");
 
 	/* Window */
 	ad->win = elm_win_util_standard_add(PACKAGE, PACKAGE);
@@ -159,7 +158,11 @@ pipe_cb(void *data, void *buf, unsigned int len)
 	/* Now, we get a player surface to be set here. */
 	appdata_s *ad = data;
 	tbm_surface_h surface;
+#if _CAN_USE_NATIVE_SURFACE_TBM
 	Evas_Native_Surface surf;
+#endif
+	tbm_surface_info_s suf_info;
+	uint32_t plane_idx;
 	int ret;
 	GList *last_item = NULL;
 
@@ -207,6 +210,7 @@ pipe_cb(void *data, void *buf, unsigned int len)
 
 	g_mutex_unlock(&ad->buffer_lock);
 
+#if _CAN_USE_NATIVE_SURFACE_TBM
 	/* Set tbm surface to image native surface */
 	memset(&surf, 0x0, sizeof(surf));
 	surf.version = EVAS_NATIVE_SURFACE_VERSION;
@@ -217,6 +221,29 @@ pipe_cb(void *data, void *buf, unsigned int len)
 
 	/* Set dirty image region to be redrawn */
 	evas_object_image_data_update_add(ad->img, 0, 0, ad->w, ad->h);
+#else
+	unsigned char *ptr = NULL;
+	unsigned char *buf_data = NULL;
+	media_format_h format = NULL;
+	media_format_mimetype_e mimetype;
+
+	media_packet_get_format(ad->packet, &format);
+	media_format_get_video_info(format, &mimetype, NULL, NULL, NULL, NULL);
+
+	if (mimetype == MEDIA_FORMAT_I420 || mimetype == MEDIA_FORMAT_NV12 || mimetype == MEDIA_FORMAT_NV12T) {
+
+		tbm_surface_get_info(surface,&suf_info);
+		buf_data = (unsigned char*)g_malloc0(suf_info.size);
+		ptr = buf_data;
+
+		for (plane_idx = 0; plane_idx < suf_info.num_planes; plane_idx++) {
+				memcpy(ptr, suf_info.planes[plane_idx].ptr, suf_info.planes[plane_idx].size);
+				ptr += suf_info.planes[plane_idx].size;
+		}
+		/* dump buf data here, if needed */
+		g_free(buf_data);
+	}
+#endif
 
 	LOGD("done");
 
