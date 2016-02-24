@@ -33,10 +33,10 @@
 #include <tbm_bufmgr.h>
 #include <tbm_surface_internal.h>
 
-#define __JOB_KEY_PREPARED	"prepared"
+#define __JOB_KEY_PREPARED		"prepared"
 #define __JOB_KEY_ERROR		"error"
 #define __JOB_KEY_SEEK_DONE	"seek_done"
-#define __JOB_KEY_EOS		"eos"
+#define __JOB_KEY_EOS			"eos"
 
 #define __RELEASEIF_PREPARE_THREAD(thread_id) \
 	do { \
@@ -1201,6 +1201,7 @@ int player_prepare_async (player_h player, player_prepared_cb callback, void* us
 	}
 	else
 	{
+		//LOGI("[%s] Event type : %d ",__FUNCTION__, _PLAYER_EVENT_TYPE_PREPARE);
 		handle->user_cb[_PLAYER_EVENT_TYPE_PREPARE] = callback;
 		handle->user_data[_PLAYER_EVENT_TYPE_PREPARE] = user_data;
 	}
@@ -1749,7 +1750,7 @@ int player_is_muted (player_h player, bool *muted)
 	}
 }
 
-int player_set_looping (player_h player, bool looping)
+int 	player_set_looping (player_h player, bool looping)
 {
 	PLAYER_INSTANCE_CHECK(player);
 	player_s * handle = (player_s *) player;
@@ -2023,6 +2024,7 @@ int player_set_playback_rate(player_h player, float rate)
 	}
 	return ret;
 }
+
 
 int player_set_display_rotation(player_h player, player_display_rotation_e rotation)
 {
@@ -2443,8 +2445,8 @@ int player_set_subtitle_path(player_h player,const char* path)
 int player_set_subtitle_position_offset(player_h player, int millisecond)
 {
 	PLAYER_INSTANCE_CHECK(player);
+//PLAYER_CHECK_CONDITION(millisecond>=0  ,PLAYER_ERROR_INVALID_PARAMETER ,"PLAYER_ERROR_INVALID_PARAMETER" );
 	player_s * handle = (player_s *) player;
-
 	if (!__player_state_validate(handle, PLAYER_STATE_PLAYING))
 	{
 		LOGE("[%s] PLAYER_ERROR_INVALID_STATE(0x%08x) : current state - %d" ,__FUNCTION__,PLAYER_ERROR_INVALID_STATE, handle->state);
@@ -3105,6 +3107,27 @@ int player_get_media_stream_buffer_min_threshold(player_h player, player_stream_
 		return PLAYER_ERROR_NONE;
 	}
 }
+
+#if 0
+int player_set_subtitle_stream_info(player_h player, player_subtitle_stream_info_s *info)
+{
+	PLAYER_INSTANCE_CHECK(player);
+	player_s * handle = (player_s *) player;
+
+	int ret = mm_player_set_subtitle_info(handle->mm_handle, (MMPlayerSubtitleStreamInfo *)info);
+
+	if(ret != MM_ERROR_NONE)
+	{
+		return __player_convert_error_code(ret,(char*)__FUNCTION__);
+	}
+	else
+	{
+		return PLAYER_ERROR_NONE;
+	}
+
+	return PLAYER_ERROR_NONE;
+}
+#endif
 
 int player_get_track_count(player_h player, player_stream_type_e type, int *count)
 {

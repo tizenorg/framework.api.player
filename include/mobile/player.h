@@ -1582,7 +1582,6 @@ int player_get_content_info(player_h player, player_content_info_e key, char ** 
  * @since_tizen 2.3
  * @remarks You must release @a audio_codec and @a video_codec using free().
  * @remarks The playback type should be local playback or HTTP streaming playback.
- * @remarks If RTSP case, this information is available after posting #MM_MESSAGE_BEGIN_OF_STREAM.
  * @param[in] player The handle to the media player
  * @param[out] audio_codec The name of the audio codec \n
  *                         It can be @c NULL if there is no audio codec.
@@ -1602,7 +1601,6 @@ int player_get_codec_info(player_h player, char **audio_codec, char **video_code
  * @brief Gets the audio stream information.
  * @since_tizen 2.3
  * @remarks The playback type should be local playback or HTTP streaming playback.
- * @remarks If RTSP case, this information is available after posting #MM_MESSAGE_BEGIN_OF_STREAM.
  * @param[in] player The handle to the media player
  * @param[out]  sample_rate The audio sample rate [Hz] \n
  *                          Value can be invalid if there is no audio stream information.
@@ -1641,7 +1639,6 @@ int player_get_album_art(player_h player, void **album_art, int *size);
  * @brief Gets the video stream information.
  * @since_tizen 2.3
  * @remarks The playback type should be local playback or HTTP streaming playback.
- * @remarks If RTSP case, this information is available after posting #MM_MESSAGE_BEGIN_OF_STREAM.
  * @param[in] player The handle to the media player
  * @param[out]  fps The frame per second of the video \n
  *                  It can be @c 0 if there is no video stream information.
@@ -1661,7 +1658,6 @@ int player_get_video_stream_info(player_h player, int *fps, int *bit_rate);
  * @brief Gets the video display's height and width.
  * @since_tizen 2.3
  * @remarks The playback type should be local playback or HTTP streaming playback.
- * @remarks If RTSP case, this information is available after posting #MM_MESSAGE_BEGIN_OF_STREAM.
  * @param[in] player The handle to the media player
  * @param[out] width The width of the video \n
  *                   Value can be invalid if there is no video or no display is set.

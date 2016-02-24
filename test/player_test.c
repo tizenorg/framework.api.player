@@ -1779,13 +1779,9 @@ static void get_track_info(void)
 			{
 				if (player_get_track_language_code(g_player[0], type, idx, &lang_code) == PLAYER_ERROR_NONE) {
 					g_print("%d> track lang code %s %s\n", idx, lang_code, (cur_index==idx)?"**y**":"  n  ");
+					free(lang_code);
 				} else {
 					g_print("%d> track has no lang code\n", idx);
-				}
-
-				if (lang_code) {
-					free(lang_code);
-					lang_code = NULL;
 				}
 			}
 		}
